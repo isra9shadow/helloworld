@@ -50,10 +50,16 @@ pipeline {
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
           powershell '''
+            $ErrorActionPreference = "Stop"
+
             # ----------------------------
             # 0) Limpieza previa de logs/pids
             # ----------------------------
-            Remove-Item -Force -ErrorAction SilentlyContinue real.pid, mock.pid, real.log, mock.log, mock_9090.py
+            Remove-Item -Force -ErrorAction SilentlyContinue `
+              real.pid, mock.pid, `
+              real.out.log, real.err.log, `
+              mock.out.log, mock.err.log, `
+              mock_9090.py
 
             # ----------------------------
             # 1) Crear mock temporal en 9090
@@ -77,47 +83,59 @@ if __name__ == "__main__":
 
             # ----------------------------
             # 2) Arrancar API REAL en 5000
-            #    (tu app expone api_application, así que FLASK_APP=app:api_application)
             # ----------------------------
             $env:FLASK_APP = "app:api_application"
             $env:FLASK_ENV = "production"
 
             $realArgs = "-m flask run --host=127.0.0.1 --port=5000"
-            $real = Start-Process -FilePath ".venv\\Scripts\\python.exe" -ArgumentList $realArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput real.log -RedirectStandardError real.log
+            $real = Start-Process -FilePath ".venv\\Scripts\\python.exe" -ArgumentList $realArgs -PassThru -WindowStyle Hidden `
+              -RedirectStandardOutput "real.out.log" -RedirectStandardError "real.err.log"
             $real.Id | Out-File -Encoding ascii real.pid
 
             # ----------------------------
             # 3) Arrancar MOCK en 9090
             # ----------------------------
-            $mock = Start-Process -FilePath ".venv\\Scripts\\python.exe" -ArgumentList "mock_9090.py" -PassThru -WindowStyle Hidden -RedirectStandardOutput mock.log -RedirectStandardError mock.log
+            $mock = Start-Process -FilePath ".venv\\Scripts\\python.exe" -ArgumentList "mock_9090.py" -PassThru -WindowStyle Hidden `
+              -RedirectStandardOutput "mock.out.log" -RedirectStandardError "mock.err.log"
             $mock.Id | Out-File -Encoding ascii mock.pid
 
             # ----------------------------
-            # 4) Esperar readiness con más reintentos
+            # 4) Esperar readiness (con reintentos)
             # ----------------------------
             function Wait-Http([string]$url) {
-              $ok = $false
               foreach ($i in 1..60) {
                 try {
                   $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri $url
-                  if ($r.StatusCode -eq 200) { $ok = $true; break }
+                  if ($r.StatusCode -eq 200) { return $true }
                 } catch {}
                 Start-Sleep -Milliseconds 500
               }
-              return $ok
+              return $false
             }
 
             $realOk = Wait-Http "$env:BASE_URL/"
             if (-not $realOk) {
-              "---- REAL LOG (real.log) ----" | Out-Host
-              if (Test-Path real.log) { Get-Content real.log -Tail 200 | Out-Host }
+              "---- REAL OUT (real.out.log) ----" | Out-Host
+              if (Test-Path "real.out.log") { Get-Content "real.out.log" -Tail 200 | Out-Host }
+              "---- REAL ERR (real.err.log) ----" | Out-Host
+              if (Test-Path "real.err.log") { Get-Content "real.err.log" -Tail 200 | Out-Host }
+
+              "---- PORT 5000 CHECK ----" | Out-Host
+              try { netstat -ano | Select-String ":5000" | Out-Host } catch {}
+
               throw "API 5000 no lista ($env:BASE_URL/)"
             }
 
             $mockOk = Wait-Http "$env:MOCK_URL/calc/sqrt/64"
             if (-not $mockOk) {
-              "---- MOCK LOG (mock.log) ----" | Out-Host
-              if (Test-Path mock.log) { Get-Content mock.log -Tail 200 | Out-Host }
+              "---- MOCK OUT (mock.out.log) ----" | Out-Host
+              if (Test-Path "mock.out.log") { Get-Content "mock.out.log" -Tail 200 | Out-Host }
+              "---- MOCK ERR (mock.err.log) ----" | Out-Host
+              if (Test-Path "mock.err.log") { Get-Content "mock.err.log" -Tail 200 | Out-Host }
+
+              "---- PORT 9090 CHECK ----" | Out-Host
+              try { netstat -ano | Select-String ":9090" | Out-Host } catch {}
+
               throw "API 9090 no lista ($env:MOCK_URL/calc/sqrt/64)"
             }
 
@@ -127,7 +145,7 @@ if __name__ == "__main__":
       }
       post {
         always {
-          archiveArtifacts artifacts: 'real.log,mock.log,real.pid,mock.pid', allowEmptyArchive: true
+          archiveArtifacts artifacts: 'real.*.log,mock.*.log,real.pid,mock.pid,mock_9090.py', allowEmptyArchive: true
         }
       }
     }
