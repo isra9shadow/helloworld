@@ -47,38 +47,49 @@ pipeline {
     }
 
     stage('Start APIs') {
+      options { timeout(time: 3, unit: 'MINUTES') }  // evita cuelgues eternos en esta fase
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
           powershell '''
             $ErrorActionPreference = "Stop"
 
             # ----------------------------
-            # 0) Limpieza previa + kill por PID previo (si existe)
+            # Helpers
             # ----------------------------
-            foreach ($f in @("real.pid","mock.pid")) {
-              if (Test-Path $f) {
-                try {
-                  $procId = (Get-Content $f | Select-Object -First 1)
-                  if ($procId) { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }
-                } catch {}
+            function Kill-ByPort([int]$port) {
+              $lines = (netstat -ano | findstr ":$port " 2>$null)
+              if ($lines) {
+                foreach ($l in $lines) {
+                  $parts = ($l -split "\\s+") | Where-Object { $_ -ne "" }
+                  if ($parts.Count -ge 5) {
+                    $pid = $parts[-1]
+                    if ($pid -match "^[0-9]+$") {
+                      try { Stop-Process -Id [int]$pid -Force -ErrorAction SilentlyContinue } catch {}
+                    }
+                  }
+                }
               }
             }
 
-            Remove-Item -Force -ErrorAction SilentlyContinue `
-              real.pid, mock.pid, `
-              real.out.log, real.err.log, `
-              mock.out.log, mock.err.log, `
-              mock_9090.py, run_real_5000.py
-
-            # (Opcional) si había algo escuchando en 5000/9090, intentamos pararlo
-            function Stop-Port([int]$port) {
-              try {
-                $pids = (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
-                foreach ($p in $pids) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }
-              } catch {}
+            function Wait-Http([string]$url) {
+              foreach ($i in 1..60) {
+                try {
+                  $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri $url
+                  if ($r.StatusCode -eq 200) { return $true }
+                } catch {}
+                Start-Sleep -Milliseconds 500
+              }
+              return $false
             }
-            Stop-Port 5000
-            Stop-Port 9090
+
+            # ----------------------------
+            # 0) Limpieza previa + matar por puerto
+            # ----------------------------
+            foreach ($f in @("real.pid","mock.pid","real.out.log","real.err.log","mock.out.log","mock.err.log","mock_9090.py","run_real_5000.py")) {
+              Remove-Item -Force -ErrorAction SilentlyContinue $f
+            }
+            Kill-ByPort 5000
+            Kill-ByPort 9090
 
             # ----------------------------
             # 1) Crear MOCK temporal en 9090
@@ -101,7 +112,8 @@ if __name__ == "__main__":
 "@ | Out-File -Encoding utf8 mock_9090.py
 
             # ----------------------------
-            # 2) Crear runner REAL 5000 con autodetección de Flask app
+            # 2) Crear runner REAL (autodetecta Flask app) en 5000
+            #    (esto es lo que te ha funcionado a mano)
             # ----------------------------
 @"
 import sys, importlib, pkgutil
@@ -114,9 +126,8 @@ def _try_module(modname):
         return None
 
 def find_flask_app():
-    # candidatos típicos (módulo o submódulos)
     candidates = [
-        "app", "app.app", "app.api", "app.main", "app.wsgi",
+        "app", "app.api", "app.app", "app.main", "app.wsgi",
         "wsgi", "main", "api", "application"
     ]
 
@@ -125,33 +136,29 @@ def find_flask_app():
         if not m:
             continue
 
-        # 1) instancias Flask directas
-        for name, obj in vars(m).items():
+        for _, obj in vars(m).items():
             try:
                 if isinstance(obj, Flask):
                     return obj
             except Exception:
                 pass
 
-        # 2) factorías create_app()
-        for fname in ("create_app",):
-            f = getattr(m, fname, None)
-            if callable(f):
-                try:
-                    a = f()
-                    if isinstance(a, Flask):
-                        return a
-                except Exception:
-                    pass
+        f = getattr(m, "create_app", None)
+        if callable(f):
+            try:
+                a = f()
+                if isinstance(a, Flask):
+                    return a
+            except Exception:
+                pass
 
-    # 3) recorrer paquete "app" buscando instancias Flask / create_app
     pkg = _try_module("app")
     if pkg and hasattr(pkg, "__path__"):
         for _, subname, _ in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + "."):
             m = _try_module(subname)
             if not m:
                 continue
-            for name, obj in vars(m).items():
+            for _, obj in vars(m).items():
                 try:
                     if isinstance(obj, Flask):
                         return obj
@@ -174,62 +181,38 @@ if __name__ == "__main__":
 "@ | Out-File -Encoding utf8 run_real_5000.py
 
             # ----------------------------
-            # 3) Arrancar REAL en 5000 (stdout/err separados)
+            # 3) Arrancar REAL y MOCK en background (stdout/err separados)
             # ----------------------------
-            $real = Start-Process -FilePath ".venv\\Scripts\\python.exe" `
-              -ArgumentList "run_real_5000.py" `
-              -PassThru -WindowStyle Hidden `
-              -RedirectStandardOutput "real.out.log" `
-              -RedirectStandardError  "real.err.log"
+            $real = Start-Process -FilePath "$env:PY" -ArgumentList "run_real_5000.py" -PassThru `
+                    -RedirectStandardOutput "real.out.log" -RedirectStandardError "real.err.log" -WorkingDirectory "$pwd"
             $real.Id | Out-File -Encoding ascii real.pid
 
-            # ----------------------------
-            # 4) Arrancar MOCK en 9090 (stdout/err separados)
-            # ----------------------------
-            $mock = Start-Process -FilePath ".venv\\Scripts\\python.exe" `
-              -ArgumentList "mock_9090.py" `
-              -PassThru -WindowStyle Hidden `
-              -RedirectStandardOutput "mock.out.log" `
-              -RedirectStandardError  "mock.err.log"
+            $mock = Start-Process -FilePath "$env:PY" -ArgumentList "mock_9090.py" -PassThru `
+                    -RedirectStandardOutput "mock.out.log" -RedirectStandardError "mock.err.log" -WorkingDirectory "$pwd"
             $mock.Id | Out-File -Encoding ascii mock.pid
 
             # ----------------------------
-            # 5) Esperar readiness (endpoint real y endpoint mock)
+            # 4) Readiness check (mejor que /)
             # ----------------------------
-            function Wait-Http200([string]$url) {
-              foreach ($i in 1..80) {
-                try {
-                  $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri $url
-                  if ($r.StatusCode -eq 200) { return $true }
-                } catch {}
-                Start-Sleep -Milliseconds 500
-              }
-              return $false
-            }
-
-            $realOk = Wait-Http200 "$env:BASE_URL/calc/add/1/2"
+            $realOk = Wait-Http "$env:BASE_URL/calc/add/1/2"
             if (-not $realOk) {
               "---- REAL OUT (real.out.log) ----" | Out-Host
               if (Test-Path real.out.log) { Get-Content real.out.log -Tail 200 | Out-Host }
               "---- REAL ERR (real.err.log) ----" | Out-Host
               if (Test-Path real.err.log) { Get-Content real.err.log -Tail 200 | Out-Host }
-
               "---- PORT 5000 CHECK ----" | Out-Host
-              cmd /c "netstat -ano | findstr :5000" | Out-Host
-
+              netstat -ano | findstr ":5000 " | Out-Host
               throw "API 5000 no lista ($env:BASE_URL/calc/add/1/2)"
             }
 
-            $mockOk = Wait-Http200 "$env:MOCK_URL/calc/sqrt/64"
+            $mockOk = Wait-Http "$env:MOCK_URL/calc/sqrt/64"
             if (-not $mockOk) {
               "---- MOCK OUT (mock.out.log) ----" | Out-Host
               if (Test-Path mock.out.log) { Get-Content mock.out.log -Tail 200 | Out-Host }
               "---- MOCK ERR (mock.err.log) ----" | Out-Host
               if (Test-Path mock.err.log) { Get-Content mock.err.log -Tail 200 | Out-Host }
-
               "---- PORT 9090 CHECK ----" | Out-Host
-              cmd /c "netstat -ano | findstr :9090" | Out-Host
-
+              netstat -ano | findstr ":9090 " | Out-Host
               throw "API 9090 no lista ($env:MOCK_URL/calc/sqrt/64)"
             }
 
@@ -239,7 +222,7 @@ if __name__ == "__main__":
       }
       post {
         always {
-          archiveArtifacts artifacts: 'real.out.log,real.err.log,mock.out.log,mock.err.log,real.pid,mock.pid', allowEmptyArchive: true
+          archiveArtifacts artifacts: 'real.*.log,mock.*.log,real.pid,mock.pid,run_real_5000.py,mock_9090.py', allowEmptyArchive: true
         }
       }
     }
@@ -326,13 +309,34 @@ if __name__ == "__main__":
 
   post {
     always {
+      // matar procesos por PID y por puerto (blindado incluso si abortas/reinicias Jenkins)
       powershell '''
+        function Kill-ByPort([int]$port) {
+          $lines = (netstat -ano | findstr ":$port " 2>$null)
+          if ($lines) {
+            foreach ($l in $lines) {
+              $parts = ($l -split "\\s+") | Where-Object { $_ -ne "" }
+              if ($parts.Count -ge 5) {
+                $pid = $parts[-1]
+                if ($pid -match "^[0-9]+$") {
+                  try { Stop-Process -Id [int]$pid -Force -ErrorAction SilentlyContinue } catch {}
+                }
+              }
+            }
+          }
+        }
+
         foreach ($f in @("real.pid","mock.pid")) {
           if (Test-Path $f) {
             $procId = (Get-Content $f | Select-Object -First 1)
-            try { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue } catch {}
+            if ($procId -match "^[0-9]+$") {
+              try { Stop-Process -Id [int]$procId -Force -ErrorAction SilentlyContinue } catch {}
+            }
           }
         }
+
+        Kill-ByPort 5000
+        Kill-ByPort 9090
       '''
       echo "Pipeline finished (continuable design)."
     }
