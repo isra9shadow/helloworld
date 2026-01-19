@@ -42,20 +42,22 @@ pipeline {
         }
       }
       post {
-        always {
-          junit allowEmptyResults: true, testResults: 'result-unit.xml'
-        }
+        always { junit allowEmptyResults: true, testResults: 'result-unit.xml' }
       }
     }
 
-    // PUNTO 2: levantar API real (5000) + mock (9090) y esperar readiness
     stage('Start APIs') {
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
           powershell '''
-            # ------------------------------------------------------------
-            # 1) Crear mock temporal en 9090 (sólo lo necesario para el test)
-            # ------------------------------------------------------------
+            # ----------------------------
+            # 0) Limpieza previa de logs/pids
+            # ----------------------------
+            Remove-Item -Force -ErrorAction SilentlyContinue real.pid, mock.pid, real.log, mock.log, mock_9090.py
+
+            # ----------------------------
+            # 1) Crear mock temporal en 9090
+            # ----------------------------
 @"
 import http.client
 from flask import Flask
@@ -65,7 +67,6 @@ HEADERS = {"Content-Type": "text/plain", "Access-Control-Allow-Origin": "*"}
 
 @mock.route("/calc/sqrt/<n>", methods=["GET"])
 def sqrt(n):
-    # para este reto, basta con responder 8 cuando n=64
     if str(n) == "64":
         return ("8", http.client.OK, HEADERS)
     return ("0", http.client.OK, HEADERS)
@@ -74,46 +75,59 @@ if __name__ == "__main__":
     mock.run(host="127.0.0.1", port=9090)
 "@ | Out-File -Encoding utf8 mock_9090.py
 
-            # ------------------------------------------------------------
-            # 2) Arrancar API REAL en 5000 usando FLASK_APP=app:api_application
-            # ------------------------------------------------------------
+            # ----------------------------
+            # 2) Arrancar API REAL en 5000
+            #    (tu app expone api_application, así que FLASK_APP=app:api_application)
+            # ----------------------------
             $env:FLASK_APP = "app:api_application"
             $env:FLASK_ENV = "production"
 
-            $real = Start-Process -FilePath ".venv\\Scripts\\flask.exe" -ArgumentList "run --host=127.0.0.1 --port=5000" -PassThru -WindowStyle Hidden
+            $realArgs = "-m flask run --host=127.0.0.1 --port=5000"
+            $real = Start-Process -FilePath ".venv\\Scripts\\python.exe" -ArgumentList $realArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput real.log -RedirectStandardError real.log
             $real.Id | Out-File -Encoding ascii real.pid
 
-            # ------------------------------------------------------------
+            # ----------------------------
             # 3) Arrancar MOCK en 9090
-            # ------------------------------------------------------------
-            $mock = Start-Process -FilePath ".venv\\Scripts\\python.exe" -ArgumentList "mock_9090.py" -PassThru -WindowStyle Hidden
+            # ----------------------------
+            $mock = Start-Process -FilePath ".venv\\Scripts\\python.exe" -ArgumentList "mock_9090.py" -PassThru -WindowStyle Hidden -RedirectStandardOutput mock.log -RedirectStandardError mock.log
             $mock.Id | Out-File -Encoding ascii mock.pid
 
-            # ------------------------------------------------------------
-            # 4) Esperar a que respondan ambos (reintentos)
-            # ------------------------------------------------------------
+            # ----------------------------
+            # 4) Esperar readiness con más reintentos
+            # ----------------------------
             function Wait-Http([string]$url) {
               $ok = $false
-              30..1 | ForEach-Object {
+              foreach ($i in 1..60) {
                 try {
                   $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri $url
-                  if ($r.StatusCode -eq 200) { $ok = $true; return }
+                  if ($r.StatusCode -eq 200) { $ok = $true; break }
                 } catch {}
                 Start-Sleep -Milliseconds 500
               }
               return $ok
             }
 
-            # Tu app tiene "/" (Hello)
             $realOk = Wait-Http "$env:BASE_URL/"
-            if (-not $realOk) { throw "API 5000 no lista ($env:BASE_URL/)" }
+            if (-not $realOk) {
+              "---- REAL LOG (real.log) ----" | Out-Host
+              if (Test-Path real.log) { Get-Content real.log -Tail 200 | Out-Host }
+              throw "API 5000 no lista ($env:BASE_URL/)"
+            }
 
-            # Mock tiene sqrt
             $mockOk = Wait-Http "$env:MOCK_URL/calc/sqrt/64"
-            if (-not $mockOk) { throw "API 9090 no lista ($env:MOCK_URL/calc/sqrt/64)" }
+            if (-not $mockOk) {
+              "---- MOCK LOG (mock.log) ----" | Out-Host
+              if (Test-Path mock.log) { Get-Content mock.log -Tail 200 | Out-Host }
+              throw "API 9090 no lista ($env:MOCK_URL/calc/sqrt/64)"
+            }
 
             exit 0
           '''
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'real.log,mock.log,real.pid,mock.pid', allowEmptyArchive: true
         }
       }
     }
@@ -136,13 +150,10 @@ if __name__ == "__main__":
         }
       }
       post {
-        always {
-          junit allowEmptyResults: true, testResults: 'result-rest.xml'
-        }
+        always { junit allowEmptyResults: true, testResults: 'result-rest.xml' }
       }
     }
 
-    // El resto lo dejamos tal cual (aún no estamos en baremos / quality gates)
     stage('Static (Flake8)') {
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
@@ -165,9 +176,7 @@ if __name__ == "__main__":
         }
       }
       post {
-        always {
-          archiveArtifacts artifacts: 'bandit.log', allowEmptyArchive: true
-        }
+        always { archiveArtifacts artifacts: 'bandit.log', allowEmptyArchive: true }
       }
     }
 
@@ -185,9 +194,7 @@ if __name__ == "__main__":
         }
       }
       post {
-        always {
-          archiveArtifacts artifacts: 'jmeter.*', allowEmptyArchive: true
-        }
+        always { archiveArtifacts artifacts: 'jmeter.*', allowEmptyArchive: true }
       }
     }
 
@@ -207,11 +214,12 @@ if __name__ == "__main__":
 
   post {
     always {
+      // ✅ matar procesos sin usar $PID/$pid
       powershell '''
         foreach ($f in @("real.pid","mock.pid")) {
           if (Test-Path $f) {
-            $pid = Get-Content $f
-            try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch {}
+            $procId = (Get-Content $f | Select-Object -First 1)
+            try { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue } catch {}
           }
         }
       '''
