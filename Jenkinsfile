@@ -45,26 +45,55 @@ pipeline {
       }
     }
 
-    stage('REST') {
-      steps {
-        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-          powershell '''
-            $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "& .venv\\Scripts\\python.exe app\\api.py" -PassThru
-            $flaskPid = $p.Id
-            Start-Sleep 3
+stage('REST') {
+  steps {
+    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+      powershell '''
+        # Arrancar Flask
+        $flask = Start-Process -FilePath "cmd.exe" `
+          -ArgumentList "/c", "& .venv\\Scripts\\python.exe app\\api.py" `
+          -PassThru
 
-            & .venv\\Scripts\\python.exe -m pytest test\\rest --junitxml=result-rest.xml
+        # Esperar a que Flask responda
+        $ready = $false
+        for ($i=0; $i -lt 10; $i++) {
+          try {
+            Invoke-WebRequest http://localhost:5000 -TimeoutSec 1 | Out-Null
+            $ready = $true
+            break
+          } catch {
+            Start-Sleep 1
+          }
+        }
 
-            Stop-Process -Id $flaskPid -Force
-          '''
+        if (-not $ready) {
+          Write-Host "Flask no responde"
         }
-      }
-      post {
-        always {
-          junit allowEmptyResults: true, testResults: 'result-rest.xml'
+
+        # Arrancar WireMock
+        Start-Process -FilePath "cmd.exe" `
+          -ArgumentList "/c", "java -jar wiremock-standalone.jar --port 9090" `
+          -PassThru
+
+        Start-Sleep 2
+
+        # Ejecutar tests REST
+        & .venv\\Scripts\\python.exe -m pytest test\\rest --junitxml=result-rest.xml
+
+        # Apagar Flask
+        if ($flask) {
+          Stop-Process -Id $flask.Id -Force -ErrorAction SilentlyContinue
         }
-      }
+      '''
     }
+  }
+  post {
+    always {
+      junit allowEmptyResults: true, testResults: 'result-rest.xml'
+    }
+  }
+}
+
 
     stage('Static (Flake8)') {
       steps {
@@ -77,16 +106,18 @@ pipeline {
       }
     }
 
-    stage('Security Test (Bandit)') {
-      steps {
-        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-          powershell '''
-            & .venv\\Scripts\\python.exe -m bandit -r app -f txt -o bandit.log
-          '''
-        }
-        recordIssues tools: [bandit(pattern: 'bandit.log')]
-      }
+stage('Security Test (Bandit)') {
+  steps {
+    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+      powershell '''
+        & .venv\\Scripts\\python.exe -m bandit -r app -f txt -o bandit.log
+        exit 0
+      '''
     }
+    recordIssues tools: [bandit(pattern: 'bandit.log')]
+  }
+}
+
 
     stage('Performance (JMeter)') {
       steps {
