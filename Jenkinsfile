@@ -19,7 +19,7 @@ pipeline {
     FLAKE8_REPORT = 'flake8.log'
 
     BANDIT_JSON = 'bandit.json'
-    BANDIT_LOG  = 'bandit.log'   // formato PEP8 para Warnings-NG
+    BANDIT_LOG  = 'bandit.log'   // PEP8 parser (warnings-ng)
 
     UNIT_JUNIT = 'result-unit.xml'
     REST_JUNIT = 'result-rest.xml'
@@ -31,22 +31,28 @@ pipeline {
     JMETER_JTL = 'jmeter.jtl'
 
     // Auto instalación JMeter
-    JMETER_DIR = 'tools\\jmeter'
-    JMETER_VER = '5.6.3'
-    JMETER_ZIP = 'apache-jmeter-5.6.3.zip'
-    JMETER_URL = 'https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.6.3.zip'
+    JMETER_DIR  = 'tools\\jmeter'
+    JMETER_VER  = '5.6.3'
+    JMETER_ZIP  = 'apache-jmeter-5.6.3.zip'
+    JMETER_URL  = 'https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.6.3.zip'
     JMETER_HOME = 'tools\\jmeter\\apache-jmeter-5.6.3'
     JMETER_BAT  = 'tools\\jmeter\\apache-jmeter-5.6.3\\bin\\jmeter.bat'
 
-    // Flags para decidir resultado final SIN cortar el pipeline
-    QG_FAIL = '0'
-    QG_UNSTABLE = '0'
+    // Banderas persistentes del quality gate
+    QG_FAIL_FILE     = '.qg_fail'
+    QG_UNSTABLE_FILE = '.qg_unstable'
   }
 
   stages {
 
     stage('Checkout') {
-      steps { checkout scm }
+      steps {
+        checkout scm
+        script {
+          if (fileExists(env.QG_FAIL_FILE))     { powershell "Remove-Item -Force '${env.QG_FAIL_FILE}' -ErrorAction SilentlyContinue" }
+          if (fileExists(env.QG_UNSTABLE_FILE)) { powershell "Remove-Item -Force '${env.QG_UNSTABLE_FILE}' -ErrorAction SilentlyContinue" }
+        }
+      }
     }
 
     stage('Unit') {
@@ -179,12 +185,12 @@ pipeline {
           archiveArtifacts allowEmptyArchive: true, artifacts: "${env.FLAKE8_REPORT}"
 
           if (findings >= 10) {
-            env.QG_FAIL = '1'
+            writeFile file: env.QG_FAIL_FILE, text: '1'
             catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
               error "Flake8: ${findings} findings (>=10) => stage FAILURE, build deferred to final gate."
             }
           } else if (findings >= 8) {
-            if (env.QG_FAIL != '1') { env.QG_UNSTABLE = '1' }
+            if (!fileExists(env.QG_FAIL_FILE)) { writeFile file: env.QG_UNSTABLE_FILE, text: '1' }
             catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
               error "Flake8: ${findings} findings (>=8) => stage UNSTABLE, build deferred to final gate."
             }
@@ -233,12 +239,12 @@ pipeline {
           archiveArtifacts allowEmptyArchive: true, artifacts: "${env.BANDIT_JSON},${env.BANDIT_LOG}"
 
           if (findings >= 4) {
-            env.QG_FAIL = '1'
+            writeFile file: env.QG_FAIL_FILE, text: '1'
             catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
               error "Bandit: ${findings} findings (>=4) => stage FAILURE, build deferred to final gate."
             }
           } else if (findings >= 2) {
-            if (env.QG_FAIL != '1') { env.QG_UNSTABLE = '1' }
+            if (!fileExists(env.QG_FAIL_FILE)) { writeFile file: env.QG_UNSTABLE_FILE, text: '1' }
             catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
               error "Bandit: ${findings} findings (>=2) => stage UNSTABLE, build deferred to final gate."
             }
@@ -270,32 +276,61 @@ pipeline {
                 throw "Timeout esperando puerto: \$port"
               }
 
+              function Resolve-JavaExe {
+                \$candidates = New-Object System.Collections.Generic.List[string]
+                if (\$env:JAVA_HOME) {
+                  \$p = Join-Path \$env:JAVA_HOME 'bin\\java.exe'
+                  if (Test-Path \$p) { \$candidates.Add(\$p) }
+                }
+                try {
+                  \$cmd = Get-Command java -ErrorAction Stop
+                  if (\$cmd -and \$cmd.Source -and (Test-Path \$cmd.Source)) { \$candidates.Add(\$cmd.Source) }
+                } catch { }
+                try {
+                  \$lines = & where.exe java 2>\$null
+                  if (\$LASTEXITCODE -eq 0 -and \$lines) { \$lines | ForEach-Object { if (Test-Path \$_) { \$candidates.Add(\$_) } } }
+                } catch { }
+                \$roots = @('C:\\Program Files\\Eclipse Adoptium','C:\\Program Files\\Java')
+                foreach (\$r in \$roots) {
+                  if (Test-Path \$r) {
+                    Get-ChildItem \$r -Directory -ErrorAction SilentlyContinue |
+                      Sort-Object Name -Descending |
+                      ForEach-Object {
+                        \$p = Join-Path \$_.FullName 'bin\\java.exe'
+                        if (Test-Path \$p) { \$candidates.Add(\$p) }
+                      }
+                  }
+                }
+                \$javaExe = \$candidates | Select-Object -Unique | Select-Object -First 1
+                if (-not \$javaExe) { throw 'No se encuentra Java (java.exe).' }
+                return \$javaExe
+              }
+
               function Ensure-JMeter {
                 New-Item -ItemType Directory -Force -Path "${env.JMETER_DIR}" | Out-Null
-
                 if (!(Test-Path "${env.JMETER_BAT}")) {
                   Write-Host "JMeter no encontrado. Descargando ${env.JMETER_VER}..."
                   \$zipPath = Join-Path "${env.JMETER_DIR}" "${env.JMETER_ZIP}"
                   Invoke-WebRequest -Uri "${env.JMETER_URL}" -OutFile \$zipPath -UseBasicParsing
                   Expand-Archive -Path \$zipPath -DestinationPath "${env.JMETER_DIR}" -Force
                 }
-
-                if (!(Test-Path "${env.JMETER_BAT}")) {
-                  throw "No se pudo preparar JMeter en ${env.JMETER_BAT}"
-                }
+                if (!(Test-Path "${env.JMETER_BAT}")) { throw "No se pudo preparar JMeter en ${env.JMETER_BAT}" }
                 return "${env.JMETER_BAT}"
               }
 
+              \$javaExe = Resolve-JavaExe
+              \$javaHome = Split-Path (Split-Path \$javaExe -Parent) -Parent
+              \$env:JAVA_HOME = \$javaHome
+              \$env:PATH = "\$javaHome\\bin;\$env:PATH"
+
               \$jmeterExe = Ensure-JMeter
 
-              # Ajuste del plan para 5 hilos y 8 loops
               Copy-Item "${env.JMETER_JMX_BASE}" "${env.JMETER_JMX}" -Force
               (Get-Content "${env.JMETER_JMX}" -Raw) `
                 -replace '<stringProp name="ThreadGroup.num_threads">\\d+</stringProp>','<stringProp name="ThreadGroup.num_threads">5</stringProp>' `
                 -replace '<stringProp name="LoopController.loops">\\d+</stringProp>','<stringProp name="LoopController.loops">8</stringProp>' `
                 | Set-Content "${env.JMETER_JMX}" -Encoding UTF8
 
-              # Levanta Flask
               \$flProc = Start-Process -FilePath "cmd.exe" -ArgumentList @(
                 "/c",
                 "${env.PY} -m flask --app app/api.py run --host ${env.FLASK_HOST} --port ${env.FLASK_PORT}"
@@ -304,24 +339,24 @@ pipeline {
 
               Wait-Port ${env.FLASK_PORT} 30
 
-              # Ejecuta JMeter
               & \$jmeterExe -n -t "${env.JMETER_JMX}" -l "${env.JMETER_JTL}"
-
-              # Para Flask
-              if (Test-Path "${env.FLASK_PID_FILE}") {
-                \$flaskId = Get-Content "${env.FLASK_PID_FILE}"
-                Stop-Process -Id \$flaskId -Force -ErrorAction SilentlyContinue
-                Remove-Item "${env.FLASK_PID_FILE}" -Force -ErrorAction SilentlyContinue
-              }
             """
           }
         }
       }
       post {
         always {
+          // limpia Flask del stage de performance también
+          powershell """
+            \$ErrorActionPreference = 'SilentlyContinue'
+            if (Test-Path "${env.FLASK_PID_FILE}") {
+              \$flaskId = Get-Content "${env.FLASK_PID_FILE}"
+              Stop-Process -Id \$flaskId -Force -ErrorAction SilentlyContinue
+              Remove-Item "${env.FLASK_PID_FILE}" -Force -ErrorAction SilentlyContinue
+            }
+          """
           script {
             archiveArtifacts allowEmptyArchive: true, artifacts: "${env.JMETER_JTL},${env.JMETER_JMX}"
-
             if (fileExists(env.JMETER_JTL)) {
               perfReport sourceDataFiles: "${env.JMETER_JTL}"
             } else {
@@ -335,7 +370,7 @@ pipeline {
     stage('Coverage') {
       steps {
         script {
-          recordCoverage tools: [[parser: 'COBERTURA', pattern: "${env.COVERAGE_XML}"]], sourceFileResolver: 'NEVER_STORE'
+          recordCoverage tools: [[parser: 'COBERTURA', pattern: "${env.COVERAGE_XML}"]]
 
           def rates = powershell(returnStdout: true, script: """
             if (Test-Path "${env.COVERAGE_XML}") {
@@ -356,12 +391,12 @@ pipeline {
           boolean unstableRange = (!fail) && ((linePct >= 85.0 && linePct <= 95.0) || (branchPct >= 80.0 && branchPct <= 90.0))
 
           if (fail) {
-            env.QG_FAIL = '1'
+            writeFile file: env.QG_FAIL_FILE, text: '1'
             catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
               error "Coverage below minimum => stage FAILURE, build deferred to final gate."
             }
           } else if (unstableRange) {
-            if (env.QG_FAIL != '1') { env.QG_UNSTABLE = '1' }
+            if (!fileExists(env.QG_FAIL_FILE)) { writeFile file: env.QG_UNSTABLE_FILE, text: '1' }
             catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
               error "Coverage in UNSTABLE range => stage UNSTABLE, build deferred to final gate."
             }
@@ -375,13 +410,15 @@ pipeline {
     stage('Quality Gate (Final)') {
       steps {
         script {
-          echo "Quality Gate flags => FAIL=${env.QG_FAIL}, UNSTABLE=${env.QG_UNSTABLE}"
+          boolean fail = fileExists(env.QG_FAIL_FILE)
+          boolean unstable = fileExists(env.QG_UNSTABLE_FILE)
 
-          if (env.QG_FAIL == '1') {
+          echo "Quality Gate flags => FAIL=${fail}, UNSTABLE=${unstable}"
+
+          if (fail) {
             error "QUALITY GATE FAILED => Build FAILURE"
           }
-
-          if (env.QG_UNSTABLE == '1') {
+          if (unstable) {
             unstable "QUALITY GATE UNSTABLE => Build UNSTABLE"
           } else {
             echo "QUALITY GATE PASSED => Build SUCCESS"
