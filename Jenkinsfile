@@ -6,8 +6,7 @@ pipeline {
   }
 
   environment {
-    // Python 3.11 (ruta absoluta; evita problemas)
-    PYTHON_EXE = 'C:\\Users\\Israel\\AppData\\Local\\Programs\\Python\\Python311\\python.exe'
+    PY = 'py -3.11'
 
     FLASK_HOST = '127.0.0.1'
     FLASK_PORT = '5000'
@@ -35,10 +34,15 @@ pipeline {
           \$ErrorActionPreference = 'Stop'
           Write-Host "=== WHOAMI ==="
           whoami
-          Write-Host "=== Python ==="
-          & "${env.PYTHON_EXE}" --version
-          & "${env.PYTHON_EXE}" -c "import sys; print(sys.executable)"
-          Write-Host "=== Java ==="
+
+          Write-Host "=== PY LAUNCHER ==="
+          py -0p
+
+          Write-Host "=== PYTHON (FORZADO) ==="
+          ${env.PY} --version
+          ${env.PY} -c "import sys; print(sys.executable)"
+
+          Write-Host "=== JAVA ==="
           java -version
         """
       }
@@ -48,7 +52,7 @@ pipeline {
       steps {
         powershell """
           \$ErrorActionPreference = 'Stop'
-          & "${env.PYTHON_EXE}" -m pytest --junitxml=result-unit.xml test\\unit
+          ${env.PY} -m pytest --junitxml=result-unit.xml test\\unit
         """
       }
       post {
@@ -64,61 +68,93 @@ pipeline {
         powershell """
           \$ErrorActionPreference = 'Stop'
 
+          function Wait-Http([string]\$url, [int]\$seconds) {
+            \$deadline = (Get-Date).AddSeconds(\$seconds)
+            while ((Get-Date) -lt \$deadline) {
+              try {
+                Invoke-WebRequest -Uri \$url -UseBasicParsing -TimeoutSec 2 | Out-Null
+                return
+              } catch { }
+              Start-Sleep -Milliseconds 400
+            }
+            throw "Timeout esperando respuesta HTTP en: \$url"
+          }
+
           function Wait-Port([int]\$port, [int]\$seconds) {
             \$deadline = (Get-Date).AddSeconds(\$seconds)
             while ((Get-Date) -lt \$deadline) {
               try {
-                \$client = New-Object System.Net.Sockets.TcpClient
-                \$iar = \$client.BeginConnect('${env.FLASK_HOST}', \$port, \$null, \$null)
+                \$c = New-Object System.Net.Sockets.TcpClient
+                \$iar = \$c.BeginConnect('${env.FLASK_HOST}', \$port, \$null, \$null)
                 if (\$iar.AsyncWaitHandle.WaitOne(300)) {
-                  \$client.EndConnect(\$iar)
-                  \$client.Close()
+                  \$c.EndConnect(\$iar)
+                  \$c.Close()
                   return
                 }
-                \$client.Close()
+                \$c.Close()
               } catch { }
               Start-Sleep -Milliseconds 300
             }
-            throw "Timeout waiting for port \$port"
+            throw "Timeout esperando puerto: \$port"
           }
 
-          # ---- Ensure Wiremock JAR exists (download if missing) ----
+          # --- Preparar WireMock jar (en tools\\wiremock) ---
           New-Item -ItemType Directory -Force -Path "${env.WM_DIR}" | Out-Null
           if (!(Test-Path "${env.WM_JAR}")) {
-            Write-Host "Downloading Wiremock..."
-            Invoke-WebRequest -Uri "${env.WM_URL}" -OutFile "${env.WM_JAR}"
+            Write-Host "Descargando WireMock..."
+            Invoke-WebRequest -Uri "${env.WM_URL}" -OutFile "${env.WM_JAR}" -UseBasicParsing
           }
 
-          # ---- Start Wiremock (background) ----
-          \$wm = Start-Process -FilePath "java" -ArgumentList "-jar","${env.WM_JAR}","--port","${env.WIREMOCK_PORT}","--root-dir","test\\wiremock" -PassThru -WindowStyle Hidden
-          \$wm.Id | Out-File -Encoding ascii "${env.WIREMOCK_PID_FILE}"
+          # --- Arrancar WireMock (background) ---
+          # root-dir: donde están mappings/ (tu repo tiene test\\wiremock\\mappings)
+          \$wmProc = Start-Process -FilePath "java" -ArgumentList @(
+            "-jar","${env.WM_JAR}",
+            "--port","${env.WIREMOCK_PORT}",
+            "--root-dir","test\\wiremock",
+            "--verbose"
+          ) -PassThru -WindowStyle Hidden
 
-          # ---- Start Flask (background) ----
-          \$fl = Start-Process -FilePath "${env.PYTHON_EXE}" -ArgumentList "-m","flask","--app","app/api.py","run","--host","${env.FLASK_HOST}","--port","${env.FLASK_PORT}" -PassThru -WindowStyle Hidden
-          \$fl.Id | Out-File -Encoding ascii "${env.FLASK_PID_FILE}"
+          \$wmProc.Id | Out-File -Encoding ascii "${env.WIREMOCK_PID_FILE}"
+          Write-Host "WireMock PID: \$("\$wmProc.Id")"
 
-          # ---- Wait services ----
-          Wait-Port ${env.WIREMOCK_PORT} 25
-          Wait-Port ${env.FLASK_PORT} 25
+          # --- Arrancar Flask (background) ---
+          # Usamos -m flask para levantar el microservicio
+          \$flProc = Start-Process -FilePath "cmd.exe" -ArgumentList @(
+            "/c",
+            "${env.PY} -m flask --app app/api.py run --host ${env.FLASK_HOST} --port ${env.FLASK_PORT}"
+          ) -PassThru -WindowStyle Hidden
 
-          # ---- Run REST tests ----
-          & "${env.PYTHON_EXE}" -m pytest --junitxml=result-rest.xml test\\rest
+          \$flProc.Id | Out-File -Encoding ascii "${env.FLASK_PID_FILE}"
+          Write-Host "Flask PID: \$("\$flProc.Id")"
+
+          # --- Esperar servicios ---
+          Wait-Port ${env.WIREMOCK_PORT} 30
+          Wait-Port ${env.FLASK_PORT} 30
+
+          # Opcional (más fiable): comprobar endpoints si existen
+          # Flask: /health podría no existir; por eso no lo fuerzo.
+          # WireMock: /__admin suele responder
+          Wait-Http "http://${env.FLASK_HOST}:${env.WIREMOCK_PORT}/__admin" 30
+
+          # --- Ejecutar tests REST ---
+          ${env.PY} -m pytest --junitxml=result-rest.xml test\\rest
         """
       }
+
       post {
         always {
           powershell """
             \$ErrorActionPreference = 'SilentlyContinue'
 
             if (Test-Path "${env.FLASK_PID_FILE}") {
-              \$pid = Get-Content "${env.FLASK_PID_FILE}"
-              Stop-Process -Id \$pid -Force -ErrorAction SilentlyContinue
+              \$procId = Get-Content "${env.FLASK_PID_FILE}"
+              Stop-Process -Id \$procId -Force -ErrorAction SilentlyContinue
               Remove-Item "${env.FLASK_PID_FILE}" -Force -ErrorAction SilentlyContinue
             }
 
             if (Test-Path "${env.WIREMOCK_PID_FILE}") {
-              \$pid = Get-Content "${env.WIREMOCK_PID_FILE}"
-              Stop-Process -Id \$pid -Force -ErrorAction SilentlyContinue
+              \$procId = Get-Content "${env.WIREMOCK_PID_FILE}"
+              Stop-Process -Id \$procId -Force -ErrorAction SilentlyContinue
               Remove-Item "${env.WIREMOCK_PID_FILE}" -Force -ErrorAction SilentlyContinue
             }
           """
