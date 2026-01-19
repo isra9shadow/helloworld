@@ -1,5 +1,6 @@
 pipeline {
   agent any
+
   options { timestamps() }
 
   environment {
@@ -19,7 +20,7 @@ pipeline {
     FLAKE8_REPORT = 'flake8.log'
 
     BANDIT_JSON = 'bandit.json'
-    BANDIT_LOG  = 'bandit.log'   // log “parseable” por warnings-ng
+    BANDIT_LOG  = 'bandit.log'   // formateado tipo PEP8 para Warnings-NG
 
     UNIT_JUNIT = 'result-unit.xml'
     REST_JUNIT = 'result-rest.xml'
@@ -29,6 +30,10 @@ pipeline {
     JMETER_JMX_BASE = 'test\\jmeter\\flask.jmx'
     JMETER_JMX = 'flask_cp12.jmx'
     JMETER_JTL = 'jmeter.jtl'
+
+    // Flags para decidir resultado final SIN cortar el pipeline
+    QG_FAIL = '0'
+    QG_UNSTABLE = '0'
   }
 
   stages {
@@ -130,7 +135,6 @@ pipeline {
           ${env.PY} -m pytest --junitxml=${env.REST_JUNIT} test\\rest
         """
       }
-
       post {
         always {
           powershell """
@@ -164,110 +168,88 @@ pipeline {
           def txt = fileExists(env.FLAKE8_REPORT) ? readFile(env.FLAKE8_REPORT).trim() : ""
           int findings = (txt ? txt.split(/\r?\n/).findAll { it.trim() }.size() : 0)
 
+          // Publica en Warnings-NG (esto te funciona)
           recordIssues tools: [flake8(pattern: env.FLAKE8_REPORT)]
+          archiveArtifacts allowEmptyArchive: true, artifacts: "${env.FLAKE8_REPORT}"
 
+          // Baremos: >=10 rojo, 8-9 amarillo, <8 ok
           if (findings >= 10) {
-            catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
-              error "Flake8: ${findings} findings (>=10) => build FAILURE (but pipeline continues)."
+            env.QG_FAIL = '1'
+            catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
+              error "Flake8: ${findings} findings (>=10) => stage FAILURE, build deferred to final gate."
             }
           } else if (findings >= 8) {
-            catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
-              error "Flake8: ${findings} findings (>=8) => build UNSTABLE (but pipeline continues)."
+            if (env.QG_FAIL != '1') { env.QG_UNSTABLE = '1' }
+            catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
+              error "Flake8: ${findings} findings (>=8) => stage UNSTABLE, build deferred to final gate."
             }
           } else {
             echo "Flake8: ${findings} findings (<8) => OK."
           }
-
-          archiveArtifacts allowEmptyArchive: true, artifacts: "${env.FLAKE8_REPORT}"
         }
       }
     }
 
-stage('Security Test (Bandit)') {
-  steps {
-    script {
-      // 1) Ejecuta bandit a JSON sin tumbar el stage por exit-code
-      powershell(returnStatus: true, script: """
-        \$ErrorActionPreference = 'Continue'
-        ${env.PY} -m bandit -r app -f json -o ${env.BANDIT_JSON} 2>\$null
-        exit 0
-      """)
+    stage('Security Test (Bandit)') {
+      steps {
+        script {
+          // 1) Bandit a JSON (no rompe)
+          powershell(returnStatus: true, script: """
+            \$ErrorActionPreference = 'Continue'
+            ${env.PY} -m bandit -r app -f json -o ${env.BANDIT_JSON} 2>\$null
+            exit 0
+          """)
 
-      // 2) JSON -> bandit.log (evitando el bug del ":" con ${})
-      powershell(returnStatus: true, script: """
-        \$ErrorActionPreference = 'Continue'
-        if (Test-Path "${env.BANDIT_JSON}") {
-          \$j = Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json
-          \$j.results | ForEach-Object {
-            \$file = \$_.filename
-            \$line = \$_.line_number
-            \$test = \$_.test_id
-            \$msg  = (\$_.issue_text -replace "`r|`n",' ') -replace ':','-'
-            "\${file}:\${line}: \${test}: \${msg}"
-          } | Out-File -Encoding utf8 "${env.BANDIT_LOG}"
-        } else {
-          "" | Out-File -Encoding utf8 "${env.BANDIT_LOG}"
-        }
-        exit 0
-      """)
-
-      // 3) Cuenta findings
-      def countStr = powershell(returnStdout: true, script: """
-        if (Test-Path "${env.BANDIT_JSON}") {
-          (Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json).results.Count
-        } else { 0 }
-      """).trim()
-      int findings = countStr.isInteger() ? countStr.toInteger() : 0
-
-      // 4) Publica en Warnings-NG con Groovy Parser (compatible con tu Jenkins)
-      // Formato bandit.log: file:line: TESTID: message
-      scanForIssues tool: groovyParser(
-        id: 'bandit',
-        name: 'Bandit',
-        pattern: "${env.BANDIT_LOG}",
-        script: '''
-          import edu.hm.hafner.analysis.Issue
-          import edu.hm.hafner.analysis.Severity
-
-          def issues = []
-          file.eachLine { line ->
-            def m = line =~ /^(.*):(\\d+):\\s*(\\S+):\\s*(.*)$/
-            if (m.matches()) {
-              def fileName = m[0][1]
-              def lineNo   = Integer.parseInt(m[0][2])
-              def category = m[0][3]
-              def message  = m[0][4]
-
-              issues << new Issue.Builder()
-                .setFileName(fileName)
-                .setLineStart(lineNo)
-                .setCategory(category)
-                .setMessage(message)
-                .setSeverity(Severity.WARNING_NORMAL)
-                .build()
+          // 2) JSON -> bandit.log en formato PEP8: file:line:col: CODE message
+          powershell(returnStatus: true, script: """
+            \$ErrorActionPreference = 'Continue'
+            if (Test-Path "${env.BANDIT_JSON}") {
+              \$j = Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json
+              \$j.results | ForEach-Object {
+                \$file = \$_.filename
+                \$line = \$_.line_number
+                \$code = \$_.test_id
+                \$msg  = (\$_.issue_text -replace "`r|`n",' ') -replace ':','-'
+                "\${file}:\${line}:1: \${code} \${msg}"
+              } | Out-File -Encoding utf8 "${env.BANDIT_LOG}"
+            } else {
+              "" | Out-File -Encoding utf8 "${env.BANDIT_LOG}"
             }
+            exit 0
+          """)
+
+          // 3) Cuenta findings
+          def countStr = powershell(returnStdout: true, script: """
+            if (Test-Path "${env.BANDIT_JSON}") {
+              (Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json).results.Count
+            } else { 0 }
+          """).trim()
+          int findings = countStr.isInteger() ? countStr.toInteger() : 0
+
+          echo "Bandit findings: ${findings}"
+
+          // 4) Publica en Warnings-NG usando parser PEP8 (porque tu Jenkins no soporta parser custom)
+          recordIssues tools: [pep8(pattern: env.BANDIT_LOG)]
+
+          archiveArtifacts allowEmptyArchive: true, artifacts: "${env.BANDIT_JSON},${env.BANDIT_LOG}"
+
+          // 5) Baremos Bandit: >=4 rojo, 2-3 amarillo, <2 ok
+          if (findings >= 4) {
+            env.QG_FAIL = '1'
+            catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
+              error "Bandit: ${findings} findings (>=4) => stage FAILURE, build deferred to final gate."
+            }
+          } else if (findings >= 2) {
+            if (env.QG_FAIL != '1') { env.QG_UNSTABLE = '1' }
+            catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
+              error "Bandit: ${findings} findings (>=2) => stage UNSTABLE, build deferred to final gate."
+            }
+          } else {
+            echo "Bandit: ${findings} findings (<2) => OK."
           }
-          return issues
-        '''
-      )
-
-      // 5) Baremos CP1.2
-      if (findings >= 4) {
-        catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
-          error "Bandit: ${findings} findings (>=4) => build FAILURE (but pipeline continues)."
         }
-      } else if (findings >= 2) {
-        catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
-          error "Bandit: ${findings} findings (>=2) => build UNSTABLE (but pipeline continues)."
-        }
-      } else {
-        echo "Bandit: ${findings} findings (<2) => OK."
       }
-
-      archiveArtifacts allowEmptyArchive: true, artifacts: "${env.BANDIT_JSON},${env.BANDIT_LOG}"
     }
-  }
-}
 
     stage('Performance (JMeter)') {
       steps {
@@ -302,8 +284,6 @@ stage('Security Test (Bandit)') {
 
           \$jmeterExe = Resolve-JMeterExe
 
-          # 5 hilos + 40 add + 40 substract:
-          # 5 hilos * 8 loops = 40 ejecuciones por sampler
           Copy-Item "${env.JMETER_JMX_BASE}" "${env.JMETER_JMX}" -Force
           (Get-Content "${env.JMETER_JMX}" -Raw) `
             -replace '<stringProp name="ThreadGroup.num_threads">\\d+</stringProp>','<stringProp name="ThreadGroup.num_threads">5</stringProp>' `
@@ -338,10 +318,8 @@ stage('Security Test (Bandit)') {
     stage('Coverage') {
       steps {
         script {
-          // Publica cobertura con Coverage plugin (recordCoverage)
           recordCoverage tools: [[parser: 'COBERTURA', pattern: "${env.COVERAGE_XML}"]], sourceFileResolver: 'NEVER_STORE'
 
-          // Baremos CP1.2 (calculamos desde coverage.xml)
           def rates = powershell(returnStdout: true, script: """
             if (Test-Path "${env.COVERAGE_XML}") {
               [xml]\$x = Get-Content "${env.COVERAGE_XML}"
@@ -358,15 +336,17 @@ stage('Security Test (Bandit)') {
           echo "Coverage => Lines: ${linePct}%, Branches: ${branchPct}%"
 
           boolean fail = (linePct < 85.0) || (branchPct < 80.0)
-          boolean unstable = (!fail) && ((linePct >= 85.0 && linePct <= 95.0) || (branchPct >= 80.0 && branchPct <= 90.0))
+          boolean unstableRange = (!fail) && ((linePct >= 85.0 && linePct <= 95.0) || (branchPct >= 80.0 && branchPct <= 90.0))
 
           if (fail) {
-            catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
-              error "Coverage below minimum => FAILURE (but pipeline continues)."
+            env.QG_FAIL = '1'
+            catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
+              error "Coverage below minimum => stage FAILURE, build deferred to final gate."
             }
-          } else if (unstable) {
-            catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
-              error "Coverage in UNSTABLE range (but pipeline continues)."
+          } else if (unstableRange) {
+            if (env.QG_FAIL != '1') { env.QG_UNSTABLE = '1' }
+            catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
+              error "Coverage in UNSTABLE range => stage UNSTABLE, build deferred to final gate."
             }
           } else {
             echo "Coverage OK (lines>95 and branches>90)."
@@ -375,5 +355,22 @@ stage('Security Test (Bandit)') {
       }
     }
 
+    stage('Quality Gate (Final)') {
+      steps {
+        script {
+          echo "Quality Gate flags => FAIL=${env.QG_FAIL}, UNSTABLE=${env.QG_UNSTABLE}"
+
+          if (env.QG_FAIL == '1') {
+            error "QUALITY GATE FAILED => Build FAILURE"
+          }
+
+          if (env.QG_UNSTABLE == '1') {
+            unstable "QUALITY GATE UNSTABLE => Build UNSTABLE"
+          } else {
+            echo "QUALITY GATE PASSED => Build SUCCESS"
+          }
+        }
+      }
+    }
   }
 }
