@@ -1,6 +1,5 @@
 pipeline {
   agent any
-
   options { timestamps() }
 
   environment {
@@ -20,7 +19,7 @@ pipeline {
     FLAKE8_REPORT = 'flake8.log'
 
     BANDIT_JSON = 'bandit.json'
-    BANDIT_LOG  = 'bandit.log'   // formateado tipo PEP8 para Warnings-NG
+    BANDIT_LOG  = 'bandit.log'   // formato PEP8 para Warnings-NG
 
     UNIT_JUNIT = 'result-unit.xml'
     REST_JUNIT = 'result-rest.xml'
@@ -30,6 +29,14 @@ pipeline {
     JMETER_JMX_BASE = 'test\\jmeter\\flask.jmx'
     JMETER_JMX = 'flask_cp12.jmx'
     JMETER_JTL = 'jmeter.jtl'
+
+    // Auto instalación JMeter
+    JMETER_DIR = 'tools\\jmeter'
+    JMETER_VER = '5.6.3'
+    JMETER_ZIP = 'apache-jmeter-5.6.3.zip'
+    JMETER_URL = 'https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.6.3.zip'
+    JMETER_HOME = 'tools\\jmeter\\apache-jmeter-5.6.3'
+    JMETER_BAT  = 'tools\\jmeter\\apache-jmeter-5.6.3\\bin\\jmeter.bat'
 
     // Flags para decidir resultado final SIN cortar el pipeline
     QG_FAIL = '0'
@@ -168,11 +175,9 @@ pipeline {
           def txt = fileExists(env.FLAKE8_REPORT) ? readFile(env.FLAKE8_REPORT).trim() : ""
           int findings = (txt ? txt.split(/\r?\n/).findAll { it.trim() }.size() : 0)
 
-          // Publica en Warnings-NG (esto te funciona)
           recordIssues tools: [flake8(pattern: env.FLAKE8_REPORT)]
           archiveArtifacts allowEmptyArchive: true, artifacts: "${env.FLAKE8_REPORT}"
 
-          // Baremos: >=10 rojo, 8-9 amarillo, <8 ok
           if (findings >= 10) {
             env.QG_FAIL = '1'
             catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
@@ -193,14 +198,12 @@ pipeline {
     stage('Security Test (Bandit)') {
       steps {
         script {
-          // 1) Bandit a JSON (no rompe)
           powershell(returnStatus: true, script: """
             \$ErrorActionPreference = 'Continue'
             ${env.PY} -m bandit -r app -f json -o ${env.BANDIT_JSON} 2>\$null
             exit 0
           """)
 
-          // 2) JSON -> bandit.log en formato PEP8: file:line:col: CODE message
           powershell(returnStatus: true, script: """
             \$ErrorActionPreference = 'Continue'
             if (Test-Path "${env.BANDIT_JSON}") {
@@ -218,7 +221,6 @@ pipeline {
             exit 0
           """)
 
-          // 3) Cuenta findings
           def countStr = powershell(returnStdout: true, script: """
             if (Test-Path "${env.BANDIT_JSON}") {
               (Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json).results.Count
@@ -227,13 +229,9 @@ pipeline {
           int findings = countStr.isInteger() ? countStr.toInteger() : 0
 
           echo "Bandit findings: ${findings}"
-
-          // 4) Publica en Warnings-NG usando parser PEP8 (porque tu Jenkins no soporta parser custom)
           recordIssues tools: [pep8(pattern: env.BANDIT_LOG)]
-
           archiveArtifacts allowEmptyArchive: true, artifacts: "${env.BANDIT_JSON},${env.BANDIT_LOG}"
 
-          // 5) Baremos Bandit: >=4 rojo, 2-3 amarillo, <2 ok
           if (findings >= 4) {
             env.QG_FAIL = '1'
             catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
@@ -253,64 +251,83 @@ pipeline {
 
     stage('Performance (JMeter)') {
       steps {
-        powershell """
-          \$ErrorActionPreference = 'Stop'
+        script {
+          catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
+            powershell """
+              \$ErrorActionPreference = 'Stop'
 
-          function Wait-Port([int]\$port, [int]\$seconds) {
-            \$deadline = (Get-Date).AddSeconds(\$seconds)
-            while ((Get-Date) -lt \$deadline) {
-              try {
-                \$c = New-Object System.Net.Sockets.TcpClient
-                \$iar = \$c.BeginConnect('${env.FLASK_HOST}', \$port, \$null, \$null)
-                if (\$iar.AsyncWaitHandle.WaitOne(300)) { \$c.EndConnect(\$iar); \$c.Close(); return }
-                \$c.Close()
-              } catch { }
-              Start-Sleep -Milliseconds 300
-            }
-            throw "Timeout esperando puerto: \$port"
+              function Wait-Port([int]\$port, [int]\$seconds) {
+                \$deadline = (Get-Date).AddSeconds(\$seconds)
+                while ((Get-Date) -lt \$deadline) {
+                  try {
+                    \$c = New-Object System.Net.Sockets.TcpClient
+                    \$iar = \$c.BeginConnect('${env.FLASK_HOST}', \$port, \$null, \$null)
+                    if (\$iar.AsyncWaitHandle.WaitOne(300)) { \$c.EndConnect(\$iar); \$c.Close(); return }
+                    \$c.Close()
+                  } catch { }
+                  Start-Sleep -Milliseconds 300
+                }
+                throw "Timeout esperando puerto: \$port"
+              }
+
+              function Ensure-JMeter {
+                New-Item -ItemType Directory -Force -Path "${env.JMETER_DIR}" | Out-Null
+
+                if (!(Test-Path "${env.JMETER_BAT}")) {
+                  Write-Host "JMeter no encontrado. Descargando ${env.JMETER_VER}..."
+                  \$zipPath = Join-Path "${env.JMETER_DIR}" "${env.JMETER_ZIP}"
+                  Invoke-WebRequest -Uri "${env.JMETER_URL}" -OutFile \$zipPath -UseBasicParsing
+                  Expand-Archive -Path \$zipPath -DestinationPath "${env.JMETER_DIR}" -Force
+                }
+
+                if (!(Test-Path "${env.JMETER_BAT}")) {
+                  throw "No se pudo preparar JMeter en ${env.JMETER_BAT}"
+                }
+                return "${env.JMETER_BAT}"
+              }
+
+              \$jmeterExe = Ensure-JMeter
+
+              # Ajuste del plan para 5 hilos y 8 loops
+              Copy-Item "${env.JMETER_JMX_BASE}" "${env.JMETER_JMX}" -Force
+              (Get-Content "${env.JMETER_JMX}" -Raw) `
+                -replace '<stringProp name="ThreadGroup.num_threads">\\d+</stringProp>','<stringProp name="ThreadGroup.num_threads">5</stringProp>' `
+                -replace '<stringProp name="LoopController.loops">\\d+</stringProp>','<stringProp name="LoopController.loops">8</stringProp>' `
+                | Set-Content "${env.JMETER_JMX}" -Encoding UTF8
+
+              # Levanta Flask
+              \$flProc = Start-Process -FilePath "cmd.exe" -ArgumentList @(
+                "/c",
+                "${env.PY} -m flask --app app/api.py run --host ${env.FLASK_HOST} --port ${env.FLASK_PORT}"
+              ) -PassThru -WindowStyle Hidden
+              \$flProc.Id | Out-File -Encoding ascii "${env.FLASK_PID_FILE}"
+
+              Wait-Port ${env.FLASK_PORT} 30
+
+              # Ejecuta JMeter
+              & \$jmeterExe -n -t "${env.JMETER_JMX}" -l "${env.JMETER_JTL}"
+
+              # Para Flask
+              if (Test-Path "${env.FLASK_PID_FILE}") {
+                \$flaskId = Get-Content "${env.FLASK_PID_FILE}"
+                Stop-Process -Id \$flaskId -Force -ErrorAction SilentlyContinue
+                Remove-Item "${env.FLASK_PID_FILE}" -Force -ErrorAction SilentlyContinue
+              }
+            """
           }
-
-          function Resolve-JMeterExe {
-            if (\$env:JMETER_HOME) {
-              \$p = Join-Path \$env:JMETER_HOME 'bin\\jmeter.bat'
-              if (Test-Path \$p) { return \$p }
-            }
-            try {
-              \$lines = & where.exe jmeter.bat 2>\$null
-              if (\$LASTEXITCODE -eq 0 -and \$lines) { return \$lines[0] }
-            } catch { }
-            throw 'No se encuentra JMeter (jmeter.bat). Pon JMETER_HOME o jmeter en PATH.'
-          }
-
-          \$jmeterExe = Resolve-JMeterExe
-
-          Copy-Item "${env.JMETER_JMX_BASE}" "${env.JMETER_JMX}" -Force
-          (Get-Content "${env.JMETER_JMX}" -Raw) `
-            -replace '<stringProp name="ThreadGroup.num_threads">\\d+</stringProp>','<stringProp name="ThreadGroup.num_threads">5</stringProp>' `
-            -replace '<stringProp name="LoopController.loops">\\d+</stringProp>','<stringProp name="LoopController.loops">8</stringProp>' `
-            | Set-Content "${env.JMETER_JMX}" -Encoding UTF8
-
-          \$flProc = Start-Process -FilePath "cmd.exe" -ArgumentList @(
-            "/c",
-            "${env.PY} -m flask --app app/api.py run --host ${env.FLASK_HOST} --port ${env.FLASK_PORT}"
-          ) -PassThru -WindowStyle Hidden
-          \$flProc.Id | Out-File -Encoding ascii "${env.FLASK_PID_FILE}"
-
-          Wait-Port ${env.FLASK_PORT} 30
-
-          & \$jmeterExe -n -t "${env.JMETER_JMX}" -l "${env.JMETER_JTL}"
-
-          if (Test-Path "${env.FLASK_PID_FILE}") {
-            \$flaskId = Get-Content "${env.FLASK_PID_FILE}"
-            Stop-Process -Id \$flaskId -Force -ErrorAction SilentlyContinue
-            Remove-Item "${env.FLASK_PID_FILE}" -Force -ErrorAction SilentlyContinue
-          }
-        """
+        }
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: "${env.JMETER_JTL},${env.JMETER_JMX}"
-          perfReport sourceDataFiles: "${env.JMETER_JTL}"
+          script {
+            archiveArtifacts allowEmptyArchive: true, artifacts: "${env.JMETER_JTL},${env.JMETER_JMX}"
+
+            if (fileExists(env.JMETER_JTL)) {
+              perfReport sourceDataFiles: "${env.JMETER_JTL}"
+            } else {
+              echo "perfReport: no hay ${env.JMETER_JTL} (JMeter no generó resultados)."
+            }
+          }
         }
       }
     }
