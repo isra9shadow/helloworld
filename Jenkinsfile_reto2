@@ -1,0 +1,356 @@
+def HAS_FAIL = false
+def HAS_UNSTABLE = false
+
+def markStage = { String status, String msg ->
+    if (status == 'SUCCESS') return
+    if (status == 'FAILURE') HAS_FAIL = true
+    if (status == 'UNSTABLE') HAS_UNSTABLE = true
+    catchError(buildResult: 'SUCCESS', stageResult: status) { error(msg) }
+}
+
+pipeline {
+    agent none
+
+    options {
+        timestamps()
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        string(name: 'AGENT_1', defaultValue: 'agent1', description: 'Label agente 1')
+        string(name: 'AGENT_2', defaultValue: 'agent2', description: 'Label agente 2')
+        string(name: 'AGENT_3', defaultValue: 'agent3', description: 'Label agente 3')
+    }
+
+    environment {
+        VENV_DIR     = ".venv"
+        REQUIREMENTS = "requirements-ci.txt"
+        JMETER_JMX   = "test/jmeter/flask.jmx"
+        JMETER_JTL   = "jmeter.jtl"
+    }
+
+    stages {
+
+        stage('Get Code') {
+            agent { label params.AGENT_1 }
+            steps {
+                deleteDir()
+                checkout scm
+
+                powershell '''
+                    whoami
+                    hostname
+                    Write-Host ("WORKSPACE=" + $env:WORKSPACE)
+                '''
+
+                stash name: 'src', includes: '**/*', excludes: '.git/**,.venv/**,**/*.log,**/coverage.xml,**/result-*.xml,**/jmeter.jtl'
+            }
+            post {
+                always { deleteDir() }
+            }
+        }
+
+        stage('Parallel CI') {
+            parallel {
+
+                stage('Unit') {
+                    agent { label params.AGENT_1 }
+                    steps {
+                        deleteDir()
+                        unstash 'src'
+
+                        powershell '''
+                            whoami
+                            hostname
+                            Write-Host ("WORKSPACE=" + $env:WORKSPACE)
+                        '''
+
+                        catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                            powershell '''
+                                $ErrorActionPreference = "Stop"
+                                $venv = Join-Path $env:WORKSPACE $env:VENV_DIR
+                                python -m venv $venv
+                                $py = Join-Path $venv "Scripts\\python.exe"
+                                & $py -m pip install -U pip
+                                & $py -m pip install -r $env:REQUIREMENTS
+
+                                & $py -m coverage erase
+                                & $py -m coverage run --omit="app/api.py,app/__init__.py" -m pytest -q test\\unit --junitxml=result-unit.xml
+                                & $py -m coverage xml -o coverage.xml
+                                & $py -m coverage report -m | Out-File -FilePath coverage-report.txt -Encoding utf8
+                            '''
+                        }
+
+                        stash name: 'cov', includes: 'coverage.xml,coverage-report.txt'
+                    }
+                    post {
+                        always {
+                            junit testResults: 'result-unit.xml', allowEmptyResults: true
+                            archiveArtifacts artifacts: 'result-unit.xml,coverage.xml,coverage-report.txt', allowEmptyArchive: true
+                            deleteDir()
+                        }
+                    }
+                }
+
+                stage('Static (Flake8)') {
+                    agent { label params.AGENT_2 }
+                    steps {
+                        deleteDir()
+                        unstash 'src'
+
+                        powershell '''
+                            whoami
+                            hostname
+                            Write-Host ("WORKSPACE=" + $env:WORKSPACE)
+                        '''
+
+                        powershell '''
+                            $ErrorActionPreference = "Stop"
+                            $venv = Join-Path $env:WORKSPACE $env:VENV_DIR
+                            python -m venv $venv
+                            $py = Join-Path $venv "Scripts\\python.exe"
+                            & $py -m pip install -U pip
+                            & $py -m pip install -r $env:REQUIREMENTS
+
+                            & $py -m flake8 app test --statistics --exit-zero | Tee-Object -FilePath flake8.log
+                        '''
+
+                        script {
+                            recordIssues tools: [flake8(pattern: 'flake8.log')], id: 'flake8'
+                            archiveArtifacts artifacts: 'flake8.log', allowEmptyArchive: true
+
+                            def out = powershell(returnStdout: true, script: '''
+                                $n = (Get-Content flake8.log | Select-String -Pattern '^[^:]+:\\d+:\\d+:' ).Count
+                                Write-Output $n
+                            ''').trim()
+
+                            int findings = out ? out.toInteger() : 0
+                            echo "Flake8 findings: ${findings}"
+
+                            def status = 'SUCCESS'
+                            if (findings >= 10) status = 'FAILURE'
+                            else if (findings >= 8) status = 'UNSTABLE'
+
+                            markStage(status, "Flake8: ${findings} findings => ${status} (pipeline continues)")
+                        }
+                    }
+                    post {
+                        always { deleteDir() }
+                    }
+                }
+
+                stage('Security Test (Bandit)') {
+                    agent { label params.AGENT_3 }
+                    steps {
+                        deleteDir()
+                        unstash 'src'
+
+                        powershell '''
+                            whoami
+                            hostname
+                            Write-Host ("WORKSPACE=" + $env:WORKSPACE)
+                        '''
+
+                        powershell '''
+                            $ErrorActionPreference = "Stop"
+                            $venv = Join-Path $env:WORKSPACE $env:VENV_DIR
+                            python -m venv $venv
+                            $py = Join-Path $venv "Scripts\\python.exe"
+                            & $py -m pip install -U pip
+                            & $py -m pip install -r $env:REQUIREMENTS
+
+                            & $py -m bandit -r app -f custom --msg-template "{path}:{line}: {test_id} {msg}" -o bandit.log
+                            exit 0
+                        '''
+
+                        script {
+                            recordIssues tools: [pep8(pattern: 'bandit.log')], id: 'bandit'
+                            archiveArtifacts artifacts: 'bandit.log', allowEmptyArchive: true
+
+                            def out = powershell(returnStdout: true, script: '''
+                                if (Test-Path bandit.log) {
+                                    $n = (Get-Content bandit.log | Select-String -Pattern '^[^:]+:\\d+:' ).Count
+                                    Write-Output $n
+                                } else {
+                                    Write-Output 0
+                                }
+                            ''').trim()
+
+                            int findings = out ? out.toInteger() : 0
+                            echo "Bandit findings: ${findings}"
+
+                            def status = 'SUCCESS'
+                            if (findings >= 4) status = 'FAILURE'
+                            else if (findings >= 2) status = 'UNSTABLE'
+
+                            markStage(status, "Bandit: ${findings} findings => ${status} (pipeline continues)")
+                        }
+                    }
+                    post {
+                        always { deleteDir() }
+                    }
+                }
+            }
+        }
+
+        stage('REST') {
+            agent { label params.AGENT_2 }
+            steps {
+                deleteDir()
+                unstash 'src'
+
+                powershell '''
+                    whoami
+                    hostname
+                    Write-Host ("WORKSPACE=" + $env:WORKSPACE)
+                '''
+
+                catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                    powershell '''
+                        $ErrorActionPreference = "Stop"
+                        $venv = Join-Path $env:WORKSPACE $env:VENV_DIR
+                        python -m venv $venv
+                        $py = Join-Path $venv "Scripts\\python.exe"
+                        & $py -m pip install -U pip
+                        & $py -m pip install -r $env:REQUIREMENTS
+
+                        $p = Start-Process -FilePath $py -ArgumentList "-m","flask","--app","app.api","run","--host","127.0.0.1","--port","5000","--no-reload" -PassThru -WindowStyle Hidden
+                        $pid = $p.Id
+
+                        try {
+                            $ready = $false
+                            for ($i=0; $i -lt 30; $i++) {
+                                try {
+                                    $r = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:5000/health" -TimeoutSec 2
+                                    if ($r.StatusCode -eq 200) { $ready = $true; break }
+                                } catch { Start-Sleep -Seconds 1 }
+                            }
+                            if (-not $ready) { throw "Flask not ready on :5000" }
+
+                            & $py -m pytest -q test\\rest --junitxml=result-rest.xml
+                        } finally {
+                            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+                        }
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit testResults: 'result-rest.xml', allowEmptyResults: true
+                    archiveArtifacts artifacts: 'result-rest.xml', allowEmptyArchive: true
+                    deleteDir()
+                }
+            }
+        }
+
+        stage('Performance (JMeter)') {
+            agent { label params.AGENT_2 }
+            steps {
+                deleteDir()
+                unstash 'src'
+
+                powershell '''
+                    whoami
+                    hostname
+                    Write-Host ("WORKSPACE=" + $env:WORKSPACE)
+                '''
+
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+                    $venv = Join-Path $env:WORKSPACE $env:VENV_DIR
+                    python -m venv $venv
+                    $py = Join-Path $venv "Scripts\\python.exe"
+                    & $py -m pip install -U pip
+                    & $py -m pip install -r $env:REQUIREMENTS
+
+                    $jm = $env:JMETER_BIN
+                    if (-not $jm) {
+                        $cmd = Get-Command jmeter.bat -ErrorAction SilentlyContinue
+                        if ($cmd) { $jm = $cmd.Source }
+                    }
+                    if (-not $jm) {
+                        $cand = Get-ChildItem -Path "C:\\apache-jmeter*\\bin\\jmeter.bat","C:\\JMeter*\\bin\\jmeter.bat","C:\\tools\\apache-jmeter*\\bin\\jmeter.bat" -ErrorAction SilentlyContinue | Select-Object -First 1
+                        if ($cand) { $jm = $cand.FullName }
+                    }
+                    if (-not $jm) { throw "JMeter not found. Set JMETER_BIN or add it to PATH." }
+
+                    if (Test-Path $env:JMETER_JTL) { Remove-Item -Force $env:JMETER_JTL }
+
+                    $p = Start-Process -FilePath $py -ArgumentList "-m","flask","--app","app.api","run","--host","127.0.0.1","--port","5000","--no-reload" -PassThru -WindowStyle Hidden
+                    $pid = $p.Id
+
+                    try {
+                        $ready = $false
+                        for ($i=0; $i -lt 30; $i++) {
+                            try {
+                                $r = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:5000/health" -TimeoutSec 2
+                                if ($r.StatusCode -eq 200) { $ready = $true; break }
+                            } catch { Start-Sleep -Seconds 1 }
+                        }
+                        if (-not $ready) { throw "Flask not ready on :5000" }
+
+                        & $jm -n -t $env:JMETER_JMX -l $env:JMETER_JTL
+                    } finally {
+                        Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+                    }
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'jmeter.jtl', allowEmptyArchive: true
+                    perfReport sourceDataFiles: 'jmeter.jtl', percentiles: '0,50,90,95,100'
+                    deleteDir()
+                }
+            }
+        }
+
+        stage('Coverage') {
+            agent { label params.AGENT_1 }
+            steps {
+                deleteDir()
+                unstash 'src'
+                unstash 'cov'
+
+                powershell '''
+                    whoami
+                    hostname
+                    Write-Host ("WORKSPACE=" + $env:WORKSPACE)
+                '''
+
+                script {
+                    recordCoverage tools: [cobertura(pattern: 'coverage.xml')]
+
+                    def xml = readFile('coverage.xml')
+                    def mLine = (xml =~ /line-rate="([0-9.]+)"/)
+                    def mBranch = (xml =~ /branch-rate="([0-9.]+)"/)
+
+                    double linePct = mLine ? (mLine[0][1] as double) * 100.0 : 0.0
+                    double branchPct = mBranch ? (mBranch[0][1] as double) * 100.0 : 0.0
+
+                    echo String.format("Coverage => Lines: %.2f%%, Branches: %.2f%%", linePct, branchPct)
+
+                    def status = 'SUCCESS'
+                    if (linePct < 85.0 || branchPct < 80.0) status = 'FAILURE'
+                    else if (linePct < 95.0 || branchPct < 90.0) status = 'UNSTABLE'
+
+                    markStage(status, String.format("Coverage: Lines %.2f%%, Branches %.2f%% => %s (pipeline continues)", linePct, branchPct, status))
+                }
+            }
+            post {
+                always { deleteDir() }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def finalStatus = 'SUCCESS'
+                if (HAS_FAIL) finalStatus = 'FAILURE'
+                else if (HAS_UNSTABLE) finalStatus = 'UNSTABLE'
+                currentBuild.result = finalStatus
+                echo "Build health final => ${finalStatus}"
+            }
+        }
+    }
+}

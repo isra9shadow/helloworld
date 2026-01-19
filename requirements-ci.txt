@@ -1,0 +1,8 @@
+@"
+pytest
+coverage
+flake8
+bandit
+flask
+requests
+"@ | Set-Content requirements-ci.txt -Encoding UTF8
