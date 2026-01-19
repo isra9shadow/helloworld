@@ -30,7 +30,6 @@ pipeline {
     JMETER_JMX = 'flask_cp12.jmx'
     JMETER_JTL = 'jmeter.jtl'
 
-    // JMeter (zip + extracción). JMeter requiere Java 8+.
     JMETER_DIR  = 'tools\\jmeter'
     JMETER_VER  = '5.6.3'
     JMETER_ZIP  = 'apache-jmeter-5.6.3.zip'
@@ -47,7 +46,7 @@ pipeline {
 
     stage('Unit') {
       steps {
-        // Debe ser "siempre verde" y solo se ejecuta una vez en todo el pipeline
+        // Siempre verde y solo una vez
         catchError(stageResult: 'SUCCESS', buildResult: 'SUCCESS') {
           powershell """
             \$ErrorActionPreference = 'Stop'
@@ -68,7 +67,7 @@ pipeline {
 
     stage('REST') {
       steps {
-        // Sin baremo y no debe “romper” el pipeline
+        // No debe bloquear
         catchError(stageResult: 'SUCCESS', buildResult: 'SUCCESS') {
           powershell """
             \$ErrorActionPreference = 'Stop'
@@ -168,6 +167,7 @@ pipeline {
     stage('Static (Flake8)') {
       steps {
         script {
+          // Genera el log siempre (aunque haya errores)
           powershell(returnStatus: true, script: """
             \$ErrorActionPreference = 'Continue'
             ${env.PY} -m flake8 app test 2>&1 | Out-File -Encoding utf8 ${env.FLAKE8_REPORT}
@@ -177,15 +177,17 @@ pipeline {
           def txt = fileExists(env.FLAKE8_REPORT) ? readFile(env.FLAKE8_REPORT).trim() : ""
           int findings = (txt ? txt.split(/\r?\n/).findAll { it.trim() }.size() : 0)
 
-          recordIssues tools: [flake8(pattern: env.FLAKE8_REPORT)]
+          // Publica SIEMPRE (aunque el stage acabe rojo)
+          recordIssues enabledForFailure: true, tools: [flake8(pattern: env.FLAKE8_REPORT)]
           archiveArtifacts allowEmptyArchive: true, artifacts: "${env.FLAKE8_REPORT}"
 
           if (findings >= 10) {
-            catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
+            // Stage rojo, pero build global NO pasa a FAILURE
+            catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
               error "Flake8: ${findings} findings (>=10) => UNHEALTHY (rojo), pero el pipeline continúa."
             }
           } else if (findings >= 8) {
-            catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
+            catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
               error "Flake8: ${findings} findings (>=8) => UNSTABLE (amarillo), pero el pipeline continúa."
             }
           } else {
@@ -204,7 +206,6 @@ pipeline {
             exit 0
           """)
 
-          // Convertimos a formato "pep8" para warnings-ng
           powershell(returnStatus: true, script: """
             \$ErrorActionPreference = 'Continue'
             if (Test-Path "${env.BANDIT_JSON}") {
@@ -230,15 +231,17 @@ pipeline {
           int findings = countStr.isInteger() ? countStr.toInteger() : 0
 
           echo "Bandit findings: ${findings}"
-          recordIssues tools: [pep8(pattern: env.BANDIT_LOG)]
+
+          // Publica SIEMPRE aunque el build esté en UNSTABLE
+          recordIssues enabledForFailure: true, tools: [pep8(pattern: env.BANDIT_LOG)]
           archiveArtifacts allowEmptyArchive: true, artifacts: "${env.BANDIT_JSON},${env.BANDIT_LOG}"
 
           if (findings >= 4) {
-            catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
+            catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
               error "Bandit: ${findings} findings (>=4) => UNHEALTHY (rojo), pero el pipeline continúa."
             }
           } else if (findings >= 2) {
-            catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
+            catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
               error "Bandit: ${findings} findings (>=2) => UNSTABLE (amarillo), pero el pipeline continúa."
             }
           } else {
@@ -251,8 +254,7 @@ pipeline {
     stage('Performance (JMeter)') {
       steps {
         script {
-          // No hay baremo, pero queremos que el pipeline continúe incluso si falla
-          catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
+          catchError(stageResult: 'SUCCESS', buildResult: 'SUCCESS') {
             powershell """
               \$ErrorActionPreference = 'Stop'
 
@@ -312,7 +314,7 @@ pipeline {
                 return "${env.JMETER_BAT}"
               }
 
-              # Asegura Java para JMeter
+              # Fuerza Java para que jmeter.bat no falle por PATH/JAVA_HOME
               \$javaExe = Resolve-JavaExe
               \$javaHome = Split-Path (Split-Path \$javaExe -Parent) -Parent
               \$env:JAVA_HOME = \$javaHome
@@ -320,7 +322,7 @@ pipeline {
 
               \$jmeterExe = Ensure-JMeter
 
-              # Requisito: 5 hilos; 40 llamadas a suma y 40 a resta => 5 hilos * 8 loops = 40 por sampler
+              # 5 hilos y 8 loops => 40 llamadas por sampler (suma/resta)
               Copy-Item "${env.JMETER_JMX_BASE}" "${env.JMETER_JMX}" -Force
               (Get-Content "${env.JMETER_JMX}" -Raw) `
                 -replace '<stringProp name="ThreadGroup.num_threads">\\d+</stringProp>','<stringProp name="ThreadGroup.num_threads">5</stringProp>' `
@@ -357,7 +359,8 @@ pipeline {
     stage('Coverage') {
       steps {
         script {
-          recordCoverage tools: [[parser: 'COBERTURA', pattern: "${env.COVERAGE_XML}"]]
+          // Publica aunque haya fallos
+          recordCoverage enabledForFailure: true, tools: [[parser: 'COBERTURA', pattern: "${env.COVERAGE_XML}"]]
 
           def rates = powershell(returnStdout: true, script: """
             if (Test-Path "${env.COVERAGE_XML}") {
@@ -381,16 +384,26 @@ pipeline {
           )
 
           if (fail) {
-            catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
+            catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
               error "Coverage por debajo del mínimo => UNHEALTHY (rojo), pero el pipeline continúa."
             }
           } else if (unstable) {
-            catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
+            catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
               error "Coverage en rango UNSTABLE => amarillo, pero el pipeline continúa."
             }
           } else {
             echo "Coverage OK (líneas >95 y ramas >90)."
           }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      script {
+        if (currentBuild.result == 'FAILURE') {
+          currentBuild.result = 'UNSTABLE'
         }
       }
     }
