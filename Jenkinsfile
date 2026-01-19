@@ -6,16 +6,14 @@ pipeline {
   }
 
   environment {
-    // Python (sin rutas locales): usamos el launcher con versión fijada
     PY = 'py -3.11'
 
-    // Java (sin rutas de usuario): apuntamos al JDK 17 instalado en Program Files
-    JAVA_HOME = 'C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.17.10-hotspot'
-
+    // Servicios
     FLASK_HOST = '127.0.0.1'
     FLASK_PORT = '5000'
     WIREMOCK_PORT = '9090'
 
+    // PID files
     FLASK_PID_FILE = 'flask.pid'
     WIREMOCK_PID_FILE = 'wiremock.pid'
 
@@ -29,37 +27,6 @@ pipeline {
     stage('Checkout') {
       steps {
         checkout scm
-      }
-    }
-
-    stage('Diagnostico (entorno Jenkins)') {
-      steps {
-        powershell """
-          \$ErrorActionPreference = 'Stop'
-
-          Write-Host "=== WHOAMI ==="
-          whoami
-
-          Write-Host "=== WORKSPACE ==="
-          Write-Host \$env:WORKSPACE
-
-          # Forzar Java 17 dentro del job (sin depender del PATH global del servicio)
-          \$env:JAVA_HOME = '${env.JAVA_HOME}'
-          \$env:Path = "\$env:JAVA_HOME\\bin;\$env:Path"
-
-          Write-Host "=== JAVA_HOME ==="
-          Write-Host \$env:JAVA_HOME
-
-          Write-Host "=== JAVA (resuelto) ==="
-          Get-Command java | Format-List -Property Source
-          java -version
-
-          Write-Host "=== PY LAUNCHER LIST ==="
-          py -0p
-
-          Write-Host "=== PY (FORZADO) ==="
-          ${env.PY} --version
-        """
       }
     }
 
@@ -78,14 +45,10 @@ pipeline {
       }
     }
 
-    stage('REST (Flask + WireMock + tests)') {
+    stage('REST') {
       steps {
         powershell """
           \$ErrorActionPreference = 'Stop'
-
-          # Forzar Java 17 dentro del job (sin depender del PATH global del servicio)
-          \$env:JAVA_HOME = '${env.JAVA_HOME}'
-          \$env:Path = "\$env:JAVA_HOME\\bin;\$env:Path"
 
           function Wait-Port([int]\$port, [int]\$seconds) {
             \$deadline = (Get-Date).AddSeconds(\$seconds)
@@ -105,6 +68,21 @@ pipeline {
             throw "Timeout esperando puerto: \$port"
           }
 
+          # --- Resolver Java de forma robusta ---
+          #  Si JAVA_HOME existe, si no, buscamos java.exe en PATH
+          \$javaExe = \$null
+          if (\$env:JAVA_HOME) {
+            \$candidate = Join-Path \$env:JAVA_HOME 'bin\\java.exe'
+            if (Test-Path \$candidate) { \$javaExe = \$candidate }
+          }
+          if (-not \$javaExe) {
+            \$cmd = Get-Command java -ErrorAction SilentlyContinue
+            if (\$cmd) { \$javaExe = \$cmd.Source }
+          }
+          if (-not \$javaExe) {
+            throw "No se encuentra Java (java.exe). Revisa JAVA_HOME o PATH del servicio Jenkins."
+          }
+
           # --- Preparar WireMock jar ---
           New-Item -ItemType Directory -Force -Path "${env.WM_DIR}" | Out-Null
           if (!(Test-Path "${env.WM_JAR}")) {
@@ -112,25 +90,24 @@ pipeline {
             Invoke-WebRequest -Uri "${env.WM_URL}" -OutFile "${env.WM_JAR}" -UseBasicParsing
           }
 
-          # --- Arrancar WireMock (background) ---
-          \$wmProc = Start-Process -FilePath "java" -ArgumentList @(
+          # --- Arrancar WireMock ---
+          \$wmProc = Start-Process -FilePath \$javaExe -ArgumentList @(
             "-jar","${env.WM_JAR}",
             "--port","${env.WIREMOCK_PORT}",
             "--root-dir","test\\wiremock"
           ) -PassThru -WindowStyle Hidden
 
           \$wmProc.Id | Out-File -Encoding ascii "${env.WIREMOCK_PID_FILE}"
-          Write-Host "WireMock PID: \$("\$wmProc.Id")"
+          Write-Host ("WireMock PID: {0}" -f \$wmProc.Id)
 
-          # --- Arrancar Flask (background) ---
-          # Nota: usamos cmd.exe para ejecutar el comando con 'py -3.11 ...'
+          # --- Arrancar Flask ---
           \$flProc = Start-Process -FilePath "cmd.exe" -ArgumentList @(
             "/c",
             "${env.PY} -m flask --app app/api.py run --host ${env.FLASK_HOST} --port ${env.FLASK_PORT}"
           ) -PassThru -WindowStyle Hidden
 
           \$flProc.Id | Out-File -Encoding ascii "${env.FLASK_PID_FILE}"
-          Write-Host "Flask PID: \$("\$flProc.Id")"
+          Write-Host ("Flask PID: {0}" -f \$flProc.Id)
 
           # --- Esperar servicios ---
           Wait-Port ${env.WIREMOCK_PORT} 30
@@ -146,14 +123,12 @@ pipeline {
           powershell """
             \$ErrorActionPreference = 'SilentlyContinue'
 
-            # Parar Flask
             if (Test-Path "${env.FLASK_PID_FILE}") {
               \$procId = Get-Content "${env.FLASK_PID_FILE}"
               Stop-Process -Id \$procId -Force -ErrorAction SilentlyContinue
               Remove-Item "${env.FLASK_PID_FILE}" -Force -ErrorAction SilentlyContinue
             }
 
-            # Parar WireMock
             if (Test-Path "${env.WIREMOCK_PID_FILE}") {
               \$procId = Get-Content "${env.WIREMOCK_PID_FILE}"
               Stop-Process -Id \$procId -Force -ErrorAction SilentlyContinue
