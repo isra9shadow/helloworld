@@ -1,6 +1,5 @@
 pipeline {
   agent any
-
   options { timestamps() }
 
   environment {
@@ -18,7 +17,9 @@ pipeline {
     WM_URL = 'https://repo1.maven.org/maven2/org/wiremock/wiremock-standalone/3.13.2/wiremock-standalone-3.13.2.jar'
 
     FLAKE8_REPORT = 'flake8.log'
-    BANDIT_REPORT = 'bandit.json'
+
+    BANDIT_JSON = 'bandit.json'
+    BANDIT_LOG  = 'bandit.log'   // log “parseable” por warnings-ng
 
     UNIT_JUNIT = 'result-unit.xml'
     REST_JUNIT = 'result-rest.xml'
@@ -40,8 +41,6 @@ pipeline {
       steps {
         powershell """
           \$ErrorActionPreference = 'Stop'
-
-          # Unit tests (UNA sola vez) + cobertura
           ${env.PY} -m coverage erase
           ${env.PY} -m coverage run --branch --source app -m pytest --junitxml=${env.UNIT_JUNIT} test\\unit
           ${env.PY} -m coverage xml -o ${env.COVERAGE_XML}
@@ -101,19 +100,17 @@ pipeline {
               }
             }
             \$javaExe = \$candidates | Select-Object -Unique | Select-Object -First 1
-            if (-not \$javaExe) { throw 'No se encuentra Java (java.exe). Configura JAVA_HOME o instala un JDK (Temurin/Adoptium).' }
+            if (-not \$javaExe) { throw 'No se encuentra Java (java.exe).' }
             return \$javaExe
           }
 
           \$javaExe = Resolve-JavaExe
 
-          # --- WireMock jar ---
           New-Item -ItemType Directory -Force -Path "${env.WM_DIR}" | Out-Null
           if (!(Test-Path "${env.WM_JAR}")) {
             Invoke-WebRequest -Uri "${env.WM_URL}" -OutFile "${env.WM_JAR}" -UseBasicParsing
           }
 
-          # --- Start WireMock ---
           \$wmProc = Start-Process -FilePath \$javaExe -ArgumentList @(
             "-jar","${env.WM_JAR}",
             "--port","${env.WIREMOCK_PORT}",
@@ -121,7 +118,6 @@ pipeline {
           ) -PassThru -WindowStyle Hidden
           \$wmProc.Id | Out-File -Encoding ascii "${env.WIREMOCK_PID_FILE}"
 
-          # --- Start Flask ---
           \$flProc = Start-Process -FilePath "cmd.exe" -ArgumentList @(
             "/c",
             "${env.PY} -m flask --app app/api.py run --host ${env.FLASK_HOST} --port ${env.FLASK_PORT}"
@@ -139,13 +135,11 @@ pipeline {
         always {
           powershell """
             \$ErrorActionPreference = 'SilentlyContinue'
-
             if (Test-Path "${env.FLASK_PID_FILE}") {
               \$flaskId = Get-Content "${env.FLASK_PID_FILE}"
               Stop-Process -Id \$flaskId -Force -ErrorAction SilentlyContinue
               Remove-Item "${env.FLASK_PID_FILE}" -Force -ErrorAction SilentlyContinue
             }
-
             if (Test-Path "${env.WIREMOCK_PID_FILE}") {
               \$wmId = Get-Content "${env.WIREMOCK_PID_FILE}"
               Stop-Process -Id \$wmId -Force -ErrorAction SilentlyContinue
@@ -161,7 +155,6 @@ pipeline {
     stage('Static (Flake8)') {
       steps {
         script {
-          // Ejecuta flake8 sin tumbar el stage por exit-code
           powershell(returnStatus: true, script: """
             \$ErrorActionPreference = 'Continue'
             ${env.PY} -m flake8 app test 2>&1 | Out-File -Encoding utf8 ${env.FLAKE8_REPORT}
@@ -171,19 +164,18 @@ pipeline {
           def txt = fileExists(env.FLAKE8_REPORT) ? readFile(env.FLAKE8_REPORT).trim() : ""
           int findings = (txt ? txt.split(/\r?\n/).findAll { it.trim() }.size() : 0)
 
-          // Publica en Warnings-NG (gráficas de flake8)
           recordIssues tools: [flake8(pattern: env.FLAKE8_REPORT)]
 
           if (findings >= 10) {
             catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
-              error "Flake8: ${findings} hallazgos (>=10) => build UNHEALTHY (rojo), pero continúo."
+              error "Flake8: ${findings} findings (>=10) => build FAILURE (but pipeline continues)."
             }
           } else if (findings >= 8) {
             catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
-              error "Flake8: ${findings} hallazgos (>=8) => build UNSTABLE (amarillo), pero continúo."
+              error "Flake8: ${findings} findings (>=8) => build UNSTABLE (but pipeline continues)."
             }
           } else {
-            echo "Flake8: ${findings} hallazgos (<8) => OK."
+            echo "Flake8: ${findings} findings (<8) => OK."
           }
 
           archiveArtifacts allowEmptyArchive: true, artifacts: "${env.FLAKE8_REPORT}"
@@ -194,38 +186,63 @@ pipeline {
     stage('Security Test (Bandit)') {
       steps {
         script {
+          // 1) Ejecuta bandit a JSON sin romper el stage por exit-code
           powershell(returnStatus: true, script: """
             \$ErrorActionPreference = 'Continue'
-            ${env.PY} -m bandit -r app -f json -o ${env.BANDIT_REPORT} 2>\$null
+            ${env.PY} -m bandit -r app -f json -o ${env.BANDIT_JSON} 2>\$null
             exit 0
           """)
 
-          def countStr = powershell(returnStdout: true, script: """
-            if (Test-Path "${env.BANDIT_REPORT}") {
-              (Get-Content "${env.BANDIT_REPORT}" -Raw | ConvertFrom-Json).results.Count
+          // 2) JSON -> bandit.log (formato: file:line: TESTID: message)
+          powershell(returnStatus: true, script: """
+            \$ErrorActionPreference = 'Continue'
+            if (Test-Path "${env.BANDIT_JSON}") {
+              \$j = Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json
+              \$j.results | ForEach-Object {
+                \$file = \$_.filename
+                \$line = \$_.line_number
+                \$test = \$_.test_id
+                \$msg  = (\$_.issue_text -replace "`r|`n",' ') -replace ':','-'
+                "\$file:\$line: \$test: \$msg"
+              } | Out-File -Encoding utf8 "${env.BANDIT_LOG}"
             } else {
-              0
+              "" | Out-File -Encoding utf8 "${env.BANDIT_LOG}"
             }
-          """).trim()
+            exit 0
+          """)
 
+          // 3) Cuenta findings
+          def countStr = powershell(returnStdout: true, script: """
+            if (Test-Path "${env.BANDIT_JSON}") {
+              (Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json).results.Count
+            } else { 0 }
+          """).trim()
           int findings = countStr.isInteger() ? countStr.toInteger() : 0
 
-          // Publica en Warnings-NG (gráficas de bandit)
-          recordIssues tools: [bandit(pattern: env.BANDIT_REPORT)]
+          // 4) Publica en Warnings-NG con parser genérico (NO bandit())
+          recordIssues tools: [
+            analysisParser(
+              id: 'bandit',
+              name: 'Bandit',
+              pattern: "${env.BANDIT_LOG}",
+              regularExpression: '(?<file>.+):(?<line>\\d+):\\s*(?<category>\\S+):\\s*(?<message>.*)'
+            )
+          ]
 
+          // Baremos CP1.2
           if (findings >= 4) {
             catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
-              error "Bandit: ${findings} hallazgos (>=4) => build UNHEALTHY (rojo), pero continúo."
+              error "Bandit: ${findings} findings (>=4) => build FAILURE (but pipeline continues)."
             }
           } else if (findings >= 2) {
             catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
-              error "Bandit: ${findings} hallazgos (>=2) => build UNSTABLE (amarillo), pero continúo."
+              error "Bandit: ${findings} findings (>=2) => build UNSTABLE (but pipeline continues)."
             }
           } else {
-            echo "Bandit: ${findings} hallazgos (<2) => OK."
+            echo "Bandit: ${findings} findings (<2) => OK."
           }
 
-          archiveArtifacts allowEmptyArchive: true, artifacts: "${env.BANDIT_REPORT}"
+          archiveArtifacts allowEmptyArchive: true, artifacts: "${env.BANDIT_JSON},${env.BANDIT_LOG}"
         }
       }
     }
@@ -250,29 +267,27 @@ pipeline {
           }
 
           function Resolve-JMeterExe {
-            # 1) JMETER_HOME
             if (\$env:JMETER_HOME) {
               \$p = Join-Path \$env:JMETER_HOME 'bin\\jmeter.bat'
               if (Test-Path \$p) { return \$p }
             }
-            # 2) where.exe
             try {
               \$lines = & where.exe jmeter.bat 2>\$null
               if (\$LASTEXITCODE -eq 0 -and \$lines) { return \$lines[0] }
             } catch { }
-            throw 'No se encuentra JMeter (jmeter.bat). Añade JMETER_HOME o mete jmeter en PATH.'
+            throw 'No se encuentra JMeter (jmeter.bat). Pon JMETER_HOME o jmeter en PATH.'
           }
 
           \$jmeterExe = Resolve-JMeterExe
 
-          # Creamos un JMX temporal que cumpla: 5 hilos y 40 add + 40 substract.
+          # 5 hilos + 40 add + 40 substract:
+          # 5 hilos * 8 loops = 40 ejecuciones por sampler
           Copy-Item "${env.JMETER_JMX_BASE}" "${env.JMETER_JMX}" -Force
           (Get-Content "${env.JMETER_JMX}" -Raw) `
             -replace '<stringProp name="ThreadGroup.num_threads">\\d+</stringProp>','<stringProp name="ThreadGroup.num_threads">5</stringProp>' `
             -replace '<stringProp name="LoopController.loops">\\d+</stringProp>','<stringProp name="LoopController.loops">8</stringProp>' `
             | Set-Content "${env.JMETER_JMX}" -Encoding UTF8
 
-          # Start Flask (Wiremock NO necesario en performance)
           \$flProc = Start-Process -FilePath "cmd.exe" -ArgumentList @(
             "/c",
             "${env.PY} -m flask --app app/api.py run --host ${env.FLASK_HOST} --port ${env.FLASK_PORT}"
@@ -281,10 +296,8 @@ pipeline {
 
           Wait-Port ${env.FLASK_PORT} 30
 
-          # Ejecuta JMeter en modo no-GUI generando JTL para el plugin Performance
           & \$jmeterExe -n -t "${env.JMETER_JMX}" -l "${env.JMETER_JTL}"
 
-          # Stop Flask
           if (Test-Path "${env.FLASK_PID_FILE}") {
             \$flaskId = Get-Content "${env.FLASK_PID_FILE}"
             Stop-Process -Id \$flaskId -Force -ErrorAction SilentlyContinue
@@ -303,18 +316,17 @@ pipeline {
     stage('Coverage') {
       steps {
         script {
-          // Publica Cobertura (necesita coverage.xml ya creado en Unit)
-          cobertura coberturaReportFile: "${env.COVERAGE_XML}", failNoReports: false, autoUpdateHealth: false, autoUpdateStability: false
+          // Publica cobertura con Coverage plugin (recordCoverage)
+          recordCoverage tools: [[parser: 'COBERTURA', pattern: "${env.COVERAGE_XML}"]], sourceFileResolver: 'NEVER_STORE'
 
+          // Baremos CP1.2 (calculamos desde coverage.xml)
           def rates = powershell(returnStdout: true, script: """
             if (Test-Path "${env.COVERAGE_XML}") {
               [xml]\$x = Get-Content "${env.COVERAGE_XML}"
               \$line = [double]\$x.coverage.'line-rate' * 100
               \$branch = [double]\$x.coverage.'branch-rate' * 100
               "{0:N2};{1:N2}" -f \$line, \$branch
-            } else {
-              "0;0"
-            }
+            } else { "0;0" }
           """).trim()
 
           def parts = rates.split(';')
@@ -323,25 +335,23 @@ pipeline {
 
           echo "Coverage => Lines: ${linePct}%, Branches: ${branchPct}%"
 
-          // Baremos CP1.2:
-          // Lines: 85-95 unstable; >95 OK; <85 FAIL
-          // Branch: 80-90 unstable; >90 OK; <80 FAIL
           boolean fail = (linePct < 85.0) || (branchPct < 80.0)
           boolean unstable = (!fail) && ((linePct >= 85.0 && linePct <= 95.0) || (branchPct >= 80.0 && branchPct <= 90.0))
 
           if (fail) {
             catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
-              error "Coverage por debajo de mínimos => FAIL (lines<85 o branches<80). Continúo."
+              error "Coverage below minimum => FAILURE (but pipeline continues)."
             }
           } else if (unstable) {
             catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
-              error "Coverage en zona UNSTABLE (lines 85-95 o branches 80-90). Continúo."
+              error "Coverage in UNSTABLE range (but pipeline continues)."
             }
           } else {
-            echo "Coverage OK (lines>95 y branches>90)."
+            echo "Coverage OK (lines>95 and branches>90)."
           }
         }
       }
     }
+
   }
 }
