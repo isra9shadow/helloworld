@@ -6,12 +6,19 @@ pipeline {
   }
 
   environment {
-    PY = 'py -3.11'
+    // Python 3.11 (ruta absoluta; evita problemas)
+    PYTHON_EXE = 'C:\\Users\\Israel\\AppData\\Local\\Programs\\Python\\Python311\\python.exe'
+
+    FLASK_HOST = '127.0.0.1'
     FLASK_PORT = '5000'
     WIREMOCK_PORT = '9090'
+
     FLASK_PID_FILE = 'flask.pid'
     WIREMOCK_PID_FILE = 'wiremock.pid'
-    WIREMOCK_JAR = 'test\\wiremock\\wiremock-standalone-3.13.2.jar'
+
+    WM_DIR = 'tools\\wiremock'
+    WM_JAR = 'tools\\wiremock\\wiremock-standalone-3.13.2.jar'
+    WM_URL = 'https://repo1.maven.org/maven2/org/wiremock/wiremock-standalone/3.13.2/wiremock-standalone-3.13.2.jar'
   }
 
   stages {
@@ -22,11 +29,26 @@ pipeline {
       }
     }
 
+    stage('Diagnostico') {
+      steps {
+        powershell """
+          \$ErrorActionPreference = 'Stop'
+          Write-Host "=== WHOAMI ==="
+          whoami
+          Write-Host "=== Python ==="
+          & "${env.PYTHON_EXE}" --version
+          & "${env.PYTHON_EXE}" -c "import sys; print(sys.executable)"
+          Write-Host "=== Java ==="
+          java -version
+        """
+      }
+    }
+
     stage('Unit') {
       steps {
         powershell """
           \$ErrorActionPreference = 'Stop'
-          ${env.PY} -m pytest --junitxml=result-unit.xml test\\unit
+          & "${env.PYTHON_EXE}" -m pytest --junitxml=result-unit.xml test\\unit
         """
       }
       post {
@@ -42,24 +64,12 @@ pipeline {
         powershell """
           \$ErrorActionPreference = 'Stop'
 
-          # ---- Start Wiremock (background) ----
-          if (!(Test-Path '${env.WIREMOCK_JAR}')) {
-            throw "Wiremock jar not found at: ${env.WIREMOCK_JAR}"
-          }
-
-          \$wm = Start-Process -FilePath "java" -ArgumentList "-jar","${env.WIREMOCK_JAR}","--port","${env.WIREMOCK_PORT}" -PassThru
-          \$wm.Id | Out-File -Encoding ascii ${env.WIREMOCK_PID_FILE}
-
-          # ---- Start Flask (background) ----
-          \$fl = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "${env.PY} app\\api.py" -PassThru
-          \$fl.Id | Out-File -Encoding ascii ${env.FLASK_PID_FILE}
-
           function Wait-Port([int]\$port, [int]\$seconds) {
             \$deadline = (Get-Date).AddSeconds(\$seconds)
             while ((Get-Date) -lt \$deadline) {
               try {
                 \$client = New-Object System.Net.Sockets.TcpClient
-                \$iar = \$client.BeginConnect('127.0.0.1', \$port, \$null, \$null)
+                \$iar = \$client.BeginConnect('${env.FLASK_HOST}', \$port, \$null, \$null)
                 if (\$iar.AsyncWaitHandle.WaitOne(300)) {
                   \$client.EndConnect(\$iar)
                   \$client.Close()
@@ -72,11 +82,27 @@ pipeline {
             throw "Timeout waiting for port \$port"
           }
 
-          Wait-Port ${env.WIREMOCK_PORT} 20
-          Wait-Port ${env.FLASK_PORT} 20
+          # ---- Ensure Wiremock JAR exists (download if missing) ----
+          New-Item -ItemType Directory -Force -Path "${env.WM_DIR}" | Out-Null
+          if (!(Test-Path "${env.WM_JAR}")) {
+            Write-Host "Downloading Wiremock..."
+            Invoke-WebRequest -Uri "${env.WM_URL}" -OutFile "${env.WM_JAR}"
+          }
+
+          # ---- Start Wiremock (background) ----
+          \$wm = Start-Process -FilePath "java" -ArgumentList "-jar","${env.WM_JAR}","--port","${env.WIREMOCK_PORT}","--root-dir","test\\wiremock" -PassThru -WindowStyle Hidden
+          \$wm.Id | Out-File -Encoding ascii "${env.WIREMOCK_PID_FILE}"
+
+          # ---- Start Flask (background) ----
+          \$fl = Start-Process -FilePath "${env.PYTHON_EXE}" -ArgumentList "-m","flask","--app","app/api.py","run","--host","${env.FLASK_HOST}","--port","${env.FLASK_PORT}" -PassThru -WindowStyle Hidden
+          \$fl.Id | Out-File -Encoding ascii "${env.FLASK_PID_FILE}"
+
+          # ---- Wait services ----
+          Wait-Port ${env.WIREMOCK_PORT} 25
+          Wait-Port ${env.FLASK_PORT} 25
 
           # ---- Run REST tests ----
-          ${env.PY} -m pytest --junitxml=result-rest.xml test\\rest
+          & "${env.PYTHON_EXE}" -m pytest --junitxml=result-rest.xml test\\rest
         """
       }
       post {
@@ -84,18 +110,16 @@ pipeline {
           powershell """
             \$ErrorActionPreference = 'SilentlyContinue'
 
-            # Stop Flask
-            if (Test-Path '${env.FLASK_PID_FILE}') {
-              \$pid = Get-Content '${env.FLASK_PID_FILE}'
+            if (Test-Path "${env.FLASK_PID_FILE}") {
+              \$pid = Get-Content "${env.FLASK_PID_FILE}"
               Stop-Process -Id \$pid -Force -ErrorAction SilentlyContinue
-              Remove-Item '${env.FLASK_PID_FILE}' -Force -ErrorAction SilentlyContinue
+              Remove-Item "${env.FLASK_PID_FILE}" -Force -ErrorAction SilentlyContinue
             }
 
-            # Stop Wiremock
-            if (Test-Path '${env.WIREMOCK_PID_FILE}') {
-              \$pid = Get-Content '${env.WIREMOCK_PID_FILE}'
+            if (Test-Path "${env.WIREMOCK_PID_FILE}") {
+              \$pid = Get-Content "${env.WIREMOCK_PID_FILE}"
               Stop-Process -Id \$pid -Force -ErrorAction SilentlyContinue
-              Remove-Item '${env.WIREMOCK_PID_FILE}' -Force -ErrorAction SilentlyContinue
+              Remove-Item "${env.WIREMOCK_PID_FILE}" -Force -ErrorAction SilentlyContinue
             }
           """
           junit allowEmptyResults: true, testResults: 'result-rest.xml'
