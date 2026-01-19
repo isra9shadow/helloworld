@@ -183,69 +183,91 @@ pipeline {
       }
     }
 
-    stage('Security Test (Bandit)') {
-      steps {
-        script {
-          // 1) Ejecuta bandit a JSON sin romper el stage por exit-code
-          powershell(returnStatus: true, script: """
-            \$ErrorActionPreference = 'Continue'
-            ${env.PY} -m bandit -r app -f json -o ${env.BANDIT_JSON} 2>\$null
-            exit 0
-          """)
+stage('Security Test (Bandit)') {
+  steps {
+    script {
+      // 1) Ejecuta bandit a JSON sin tumbar el stage por exit-code
+      powershell(returnStatus: true, script: """
+        \$ErrorActionPreference = 'Continue'
+        ${env.PY} -m bandit -r app -f json -o ${env.BANDIT_JSON} 2>\$null
+        exit 0
+      """)
 
-          // 2) JSON -> bandit.log (formato: file:line: TESTID: message)
-          powershell(returnStatus: true, script: """
-            \$ErrorActionPreference = 'Continue'
-            if (Test-Path "${env.BANDIT_JSON}") {
-              \$j = Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json
-              \$j.results | ForEach-Object {
-                \$file = \$_.filename
-                \$line = \$_.line_number
-                \$test = \$_.test_id
-                \$msg  = (\$_.issue_text -replace "`r|`n",' ') -replace ':','-'
-                "\$file:\$line: \$test: \$msg"
-              } | Out-File -Encoding utf8 "${env.BANDIT_LOG}"
-            } else {
-              "" | Out-File -Encoding utf8 "${env.BANDIT_LOG}"
-            }
-            exit 0
-          """)
-
-          // 3) Cuenta findings
-          def countStr = powershell(returnStdout: true, script: """
-            if (Test-Path "${env.BANDIT_JSON}") {
-              (Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json).results.Count
-            } else { 0 }
-          """).trim()
-          int findings = countStr.isInteger() ? countStr.toInteger() : 0
-
-          // 4) Publica en Warnings-NG con parser genérico (NO bandit())
-          recordIssues tools: [
-            analysisParser(
-              id: 'bandit',
-              name: 'Bandit',
-              pattern: "${env.BANDIT_LOG}",
-              regularExpression: '(?<file>.+):(?<line>\\d+):\\s*(?<category>\\S+):\\s*(?<message>.*)'
-            )
-          ]
-
-          // Baremos CP1.2
-          if (findings >= 4) {
-            catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
-              error "Bandit: ${findings} findings (>=4) => build FAILURE (but pipeline continues)."
-            }
-          } else if (findings >= 2) {
-            catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
-              error "Bandit: ${findings} findings (>=2) => build UNSTABLE (but pipeline continues)."
-            }
-          } else {
-            echo "Bandit: ${findings} findings (<2) => OK."
-          }
-
-          archiveArtifacts allowEmptyArchive: true, artifacts: "${env.BANDIT_JSON},${env.BANDIT_LOG}"
+      // 2) JSON -> bandit.log (evitando el bug del ":" con ${})
+      powershell(returnStatus: true, script: """
+        \$ErrorActionPreference = 'Continue'
+        if (Test-Path "${env.BANDIT_JSON}") {
+          \$j = Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json
+          \$j.results | ForEach-Object {
+            \$file = \$_.filename
+            \$line = \$_.line_number
+            \$test = \$_.test_id
+            \$msg  = (\$_.issue_text -replace "`r|`n",' ') -replace ':','-'
+            "\${file}:\${line}: \${test}: \${msg}"
+          } | Out-File -Encoding utf8 "${env.BANDIT_LOG}"
+        } else {
+          "" | Out-File -Encoding utf8 "${env.BANDIT_LOG}"
         }
+        exit 0
+      """)
+
+      // 3) Cuenta findings
+      def countStr = powershell(returnStdout: true, script: """
+        if (Test-Path "${env.BANDIT_JSON}") {
+          (Get-Content "${env.BANDIT_JSON}" -Raw | ConvertFrom-Json).results.Count
+        } else { 0 }
+      """).trim()
+      int findings = countStr.isInteger() ? countStr.toInteger() : 0
+
+      // 4) Publica en Warnings-NG con Groovy Parser (compatible con tu Jenkins)
+      // Formato bandit.log: file:line: TESTID: message
+      scanForIssues tool: groovyParser(
+        id: 'bandit',
+        name: 'Bandit',
+        pattern: "${env.BANDIT_LOG}",
+        script: '''
+          import edu.hm.hafner.analysis.Issue
+          import edu.hm.hafner.analysis.Severity
+
+          def issues = []
+          file.eachLine { line ->
+            def m = line =~ /^(.*):(\\d+):\\s*(\\S+):\\s*(.*)$/
+            if (m.matches()) {
+              def fileName = m[0][1]
+              def lineNo   = Integer.parseInt(m[0][2])
+              def category = m[0][3]
+              def message  = m[0][4]
+
+              issues << new Issue.Builder()
+                .setFileName(fileName)
+                .setLineStart(lineNo)
+                .setCategory(category)
+                .setMessage(message)
+                .setSeverity(Severity.WARNING_NORMAL)
+                .build()
+            }
+          }
+          return issues
+        '''
+      )
+
+      // 5) Baremos CP1.2
+      if (findings >= 4) {
+        catchError(stageResult: 'FAILURE', buildResult: 'FAILURE') {
+          error "Bandit: ${findings} findings (>=4) => build FAILURE (but pipeline continues)."
+        }
+      } else if (findings >= 2) {
+        catchError(stageResult: 'UNSTABLE', buildResult: 'UNSTABLE') {
+          error "Bandit: ${findings} findings (>=2) => build UNSTABLE (but pipeline continues)."
+        }
+      } else {
+        echo "Bandit: ${findings} findings (<2) => OK."
       }
+
+      archiveArtifacts allowEmptyArchive: true, artifacts: "${env.BANDIT_JSON},${env.BANDIT_LOG}"
     }
+  }
+}
 
     stage('Performance (JMeter)') {
       steps {
