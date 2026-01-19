@@ -38,9 +38,13 @@ pipeline {
     JMETER_HOME = 'tools\\jmeter\\apache-jmeter-5.6.3'
     JMETER_BAT  = 'tools\\jmeter\\apache-jmeter-5.6.3\\bin\\jmeter.bat'
 
-    // Banderas persistentes del quality gate
+    // Banderas persistentes (entre stages)
     QG_FAIL_FILE     = '.qg_fail'
     QG_UNSTABLE_FILE = '.qg_unstable'
+
+    // 🔥 Modo gate: false = NO rompe build (recomendado en curso DevOps si NO tocas código)
+    //              true  = rompe build en FAIL
+    ENFORCE_GATE = 'false'
   }
 
   stages {
@@ -49,8 +53,13 @@ pipeline {
       steps {
         checkout scm
         script {
-          if (fileExists(env.QG_FAIL_FILE))     { powershell "Remove-Item -Force '${env.QG_FAIL_FILE}' -ErrorAction SilentlyContinue" }
-          if (fileExists(env.QG_UNSTABLE_FILE)) { powershell "Remove-Item -Force '${env.QG_UNSTABLE_FILE}' -ErrorAction SilentlyContinue" }
+          // Limpia banderas de ejecuciones anteriores
+          if (fileExists(env.QG_FAIL_FILE)) {
+            powershell "Remove-Item -Force '${env.QG_FAIL_FILE}' -ErrorAction SilentlyContinue"
+          }
+          if (fileExists(env.QG_UNSTABLE_FILE)) {
+            powershell "Remove-Item -Force '${env.QG_UNSTABLE_FILE}' -ErrorAction SilentlyContinue"
+          }
         }
       }
     }
@@ -187,12 +196,12 @@ pipeline {
           if (findings >= 10) {
             writeFile file: env.QG_FAIL_FILE, text: '1'
             catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
-              error "Flake8: ${findings} findings (>=10) => stage FAILURE, build deferred to final gate."
+              error "Flake8: ${findings} findings (>=10) => stage FAILURE, deferred to final gate."
             }
           } else if (findings >= 8) {
             if (!fileExists(env.QG_FAIL_FILE)) { writeFile file: env.QG_UNSTABLE_FILE, text: '1' }
             catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
-              error "Flake8: ${findings} findings (>=8) => stage UNSTABLE, build deferred to final gate."
+              error "Flake8: ${findings} findings (>=8) => stage UNSTABLE, deferred to final gate."
             }
           } else {
             echo "Flake8: ${findings} findings (<8) => OK."
@@ -241,12 +250,12 @@ pipeline {
           if (findings >= 4) {
             writeFile file: env.QG_FAIL_FILE, text: '1'
             catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
-              error "Bandit: ${findings} findings (>=4) => stage FAILURE, build deferred to final gate."
+              error "Bandit: ${findings} findings (>=4) => stage FAILURE, deferred to final gate."
             }
           } else if (findings >= 2) {
             if (!fileExists(env.QG_FAIL_FILE)) { writeFile file: env.QG_UNSTABLE_FILE, text: '1' }
             catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
-              error "Bandit: ${findings} findings (>=2) => stage UNSTABLE, build deferred to final gate."
+              error "Bandit: ${findings} findings (>=2) => stage UNSTABLE, deferred to final gate."
             }
           } else {
             echo "Bandit: ${findings} findings (<2) => OK."
@@ -318,6 +327,7 @@ pipeline {
                 return "${env.JMETER_BAT}"
               }
 
+              # Fuerza Java para JMeter
               \$javaExe = Resolve-JavaExe
               \$javaHome = Split-Path (Split-Path \$javaExe -Parent) -Parent
               \$env:JAVA_HOME = \$javaHome
@@ -346,15 +356,6 @@ pipeline {
       }
       post {
         always {
-          // limpia Flask del stage de performance también
-          powershell """
-            \$ErrorActionPreference = 'SilentlyContinue'
-            if (Test-Path "${env.FLASK_PID_FILE}") {
-              \$flaskId = Get-Content "${env.FLASK_PID_FILE}"
-              Stop-Process -Id \$flaskId -Force -ErrorAction SilentlyContinue
-              Remove-Item "${env.FLASK_PID_FILE}" -Force -ErrorAction SilentlyContinue
-            }
-          """
           script {
             archiveArtifacts allowEmptyArchive: true, artifacts: "${env.JMETER_JTL},${env.JMETER_JMX}"
             if (fileExists(env.JMETER_JTL)) {
@@ -393,12 +394,12 @@ pipeline {
           if (fail) {
             writeFile file: env.QG_FAIL_FILE, text: '1'
             catchError(stageResult: 'FAILURE', buildResult: 'SUCCESS') {
-              error "Coverage below minimum => stage FAILURE, build deferred to final gate."
+              error "Coverage below minimum => stage FAILURE, deferred to final gate."
             }
           } else if (unstableRange) {
             if (!fileExists(env.QG_FAIL_FILE)) { writeFile file: env.QG_UNSTABLE_FILE, text: '1' }
             catchError(stageResult: 'UNSTABLE', buildResult: 'SUCCESS') {
-              error "Coverage in UNSTABLE range => stage UNSTABLE, build deferred to final gate."
+              error "Coverage in UNSTABLE range => stage UNSTABLE, deferred to final gate."
             }
           } else {
             echo "Coverage OK (lines>95 and branches>90)."
@@ -411,15 +412,19 @@ pipeline {
       steps {
         script {
           boolean fail = fileExists(env.QG_FAIL_FILE)
-          boolean unstable = fileExists(env.QG_UNSTABLE_FILE)
+          boolean unstableFlag = fileExists(env.QG_UNSTABLE_FILE)
+          boolean enforce = (env.ENFORCE_GATE ?: 'false').toBoolean()
 
-          echo "Quality Gate flags => FAIL=${fail}, UNSTABLE=${unstable}"
+          echo "Quality Gate flags => FAIL=${fail}, UNSTABLE=${unstableFlag}, ENFORCE=${enforce}"
 
           if (fail) {
-            error "QUALITY GATE FAILED => Build FAILURE"
-          }
-          if (unstable) {
-            unstable "QUALITY GATE UNSTABLE => Build UNSTABLE"
+            if (enforce) {
+              error "QUALITY GATE FAILED => Build FAILURE"
+            } else {
+              unstable("QUALITY GATE FAILED (non-blocking) => Build UNSTABLE")
+            }
+          } else if (unstableFlag) {
+            unstable("QUALITY GATE UNSTABLE => Build UNSTABLE")
           } else {
             echo "QUALITY GATE PASSED => Build SUCCESS"
           }
